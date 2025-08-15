@@ -10,7 +10,7 @@ import (
 )
 
 func usage() {
-	fmt.Println("sonic-dpmon start|status|results|stop ...")
+	fmt.Println("telegen-sonic start|status|results|stop ...")
 	os.Exit(1)
 }
 
@@ -18,7 +18,7 @@ func main() {
 	if len(os.Args) < 2 { usage() }
 	switch os.Args[1] {
 	case "start":
-		// minimal: sonic-dpmon start PORT DURATION_SEC
+		// minimal: telegen-sonic start PORT DURATION_SEC
 		if len(os.Args) < 4 { usage() }
 		req := map[string]interface{}{
 			"port": os.Args[2], "direction": "ingress", "span_method": "span",

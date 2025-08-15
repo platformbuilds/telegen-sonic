@@ -27,7 +27,7 @@ type meter interface {
 }
 
 func (c *CollectorImpl) Run(ctx context.Context, jobID string, spec JobSpec) (ResultsProvider, error) {
-	m := otel.GetMeterProvider().Meter("sonic-dpmon")
+	m := otel.GetMeterProvider().Meter("telegen-sonic")
 	pktCtr, _ := m.Float64Counter("network.packets")
 	byteCtr, _ := m.Float64Counter("network.bytes")
 

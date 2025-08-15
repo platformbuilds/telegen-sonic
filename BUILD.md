@@ -15,7 +15,7 @@ make build
 
 Artifacts:
 - `bin/agent` (REST server)
-- `bin/sonic-dpmon` (CLI)
+- `bin/telegen-sonic` (CLI)
 - `bpf/tc_ingress.bpf.o` (eBPF program)
 
 ## Run (host)
@@ -23,13 +23,13 @@ Artifacts:
 export OTEL_EXPORTER_OTLP_ENDPOINT=collector:4317
 ./bin/agent
 # New shell
-./bin/sonic-dpmon start Ethernet16 120
+./bin/telegen-sonic start Ethernet16 120
 ```
 
 ## Docker
 ```bash
-docker build -t ghcr.io/yourorg/sonic-dpmon:latest -f deploy/Dockerfile .
-docker run --name sonic-dpmon --restart unless-stopped   --cap-add=NET_ADMIN --cap-add=BPF   -v /sys:/sys -v /proc:/proc -v /sys/fs/bpf:/sys/fs/bpf   -p 127.0.0.1:8080:8080   -e OTEL_EXPORTER_OTLP_ENDPOINT=collector:4317   ghcr.io/yourorg/sonic-dpmon:latest
+docker build -t ghcr.io/yourorg/telegen-sonic:latest -f deploy/Dockerfile .
+docker run --name telegen-sonic --restart unless-stopped   --cap-add=NET_ADMIN --cap-add=BPF   -v /sys:/sys -v /proc:/proc -v /sys/fs/bpf:/sys/fs/bpf   -p 127.0.0.1:8080:8080   -e OTEL_EXPORTER_OTLP_ENDPOINT=collector:4317   ghcr.io/yourorg/telegen-sonic:latest
 ```
 
 ## Notes

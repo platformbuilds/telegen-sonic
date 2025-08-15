@@ -1,6 +1,6 @@
-# SONiC eBPF Data‑Plane Telemetry Agent (Wiki)
+# Telegen‑Sonic eBPF Data‑Plane Telemetry Agent (Wiki)
 
-> **Name:** `sonic-dpmon`  
+> **Name:** `telegen-sonic`  
 > **Purpose:** On‑demand, per‑port **data‑plane telemetry** for SONiC, exporting **OpenTelemetry** metrics (OTLP) and exposing a **REST API + CLI**.  
 > **Concurrency limit:** **Max 2 concurrent jobs** (hard‑enforced to protect switch resources).
 
@@ -8,7 +8,7 @@
 
 ## 1) Overview
 
-`sonic-dpmon` enables network operators to start **ephemeral capture/telemetry jobs** for specific switch ports (and optional filters) **on demand**.  
+`telegen-sonic` enables network operators to start **ephemeral capture/telemetry jobs** for specific switch ports (and optional filters) **on demand**.  
 Because switch ASICs forward in hardware, the agent leverages **SPAN/ERSPAN mirroring or trap/punt** to feed copies of data‑plane packets to the CPU, where **eBPF programs** (attached via `tc clsact`) compute counters, flow stats, and latency distributions. A user‑space daemon aggregates results, exports **OTLP** to an OpenTelemetry Collector, and serves **instant job summaries** via REST/CLI.
 
 **Key features**
@@ -141,22 +141,22 @@ Responses:
 
 ## 5) CLI
 
-Wrapper around REST (`sonic-dpmon`):
+Wrapper around REST (`telegen-sonic`):
 
 ```bash
 # start
-sonic-dpmon start --port Ethernet16 --dir ingress \
+telegen-sonic start --port Ethernet16 --dir ingress \
   --span-method span --vlan 200 --sample-rate 100 \
   --filter ip_proto=tcp,udp --filter dscp=46 --duration 120
 
 # status
-sonic-dpmon status --job UUID
+telegen-sonic status --job UUID
 
 # results
-sonic-dpmon results --job UUID --format json
+telegen-sonic results --job UUID --format json
 
 # stop
-sonic-dpmon stop --job UUID
+telegen-sonic stop --job UUID
 ```
 
 On concurrency cap hit:
@@ -211,12 +211,12 @@ func releaseSlot() { atomic.AddInt32(&activeJobs, -1) }
 
 **Container run (example):**
 ```bash
-docker run --name sonic-dpmon --restart unless-stopped \
+docker run --name telegen-sonic --restart unless-stopped \
   --privileged \ 
   -v /sys:/sys -v /proc:/proc -v /sys/fs/bpf:/sys/fs/bpf \
   -p 127.0.0.1:8080:8080 \
   -e OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317 \
-  ghcr.io/yourorg/sonic-dpmon:latest
+  ghcr.io/yourorg/telegen-sonic:latest
 ```
 > Prefer minimal caps (`--cap-add=NET_ADMIN --cap-add=BPF`) when possible and mount `bpffs`.
 

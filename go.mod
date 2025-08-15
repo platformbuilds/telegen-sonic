@@ -1,4 +1,4 @@
-module github.com/platformbuilds/sonic-dpmon
+module github.com/platformbuilds/telegen-sonic
 
 go 1.23
 

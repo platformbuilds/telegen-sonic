@@ -17,7 +17,7 @@ RUN make build-agent && make build-cli
 FROM gcr.io/distroless/base-debian12:nonroot
 WORKDIR /
 COPY --from=gobuild /src/bin/agent /agent
-COPY --from=gobuild /src/bin/sonic-dpmon /sonic-dpmon
+COPY --from=gobuild /src/bin/telegen-sonic /telegen-sonic
 COPY --from=bpf /src/tc_ingress.bpf.o /bpf/tc_ingress.bpf.o
 USER 65532:65532
 ENTRYPOINT ["/agent"]

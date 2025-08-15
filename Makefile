@@ -1,6 +1,6 @@
 SHELL := /bin/bash
-APP := sonic-dpmon
-IMG := ghcr.io/platformbuilds/sonic-dpmon:latest
+APP := telegen-sonic
+IMG := ghcr.io/platformbuilds/telegen-sonic:latest
 
 .PHONY: all build bpf build-agent build-cli docker lint fmt test
 
@@ -13,7 +13,7 @@ build-agent:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/agent ./cmd/agent
 
 build-cli:
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/sonic-dpmon ./cmd/cli
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/telegen-sonic ./cmd/cli
 
 build: bpf build-agent build-cli
 

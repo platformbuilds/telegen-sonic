@@ -1,5 +1,5 @@
 [Unit]
-Description=SONiC DPMon Agent
+Description=Telegen-Sonic Agent
 After=network-online.target
 
 [Service]

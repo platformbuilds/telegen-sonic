@@ -22,4 +22,4 @@ jobs:
       - name: Go Test
         run: go test ./...
       - name: Docker build
-        run: docker build -t sonic-dpmon:ci -f deploy/Dockerfile .
+        run: docker build -t telegen-sonic:ci -f deploy/Dockerfile .

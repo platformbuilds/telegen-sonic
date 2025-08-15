@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/platformbuilds/sonic-dpmon/pkg/api"
-	"github.com/platformbuilds/sonic-dpmon/pkg/monitor"
+	"github.com/platformbuilds/telegen-sonic/pkg/api"
+	"github.com/platformbuilds/telegen-sonic/pkg/monitor"
 )
 
 type CoreAdapter struct{ S *monitor.Supervisor }
