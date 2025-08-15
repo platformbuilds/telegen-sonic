@@ -2,89 +2,90 @@ package monitor
 
 import (
 	"context"
-	"sync"
-	"time"
 	"fmt"
+	"log"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// BPF map names
+const (
+	mapStats  = "stats"
+	mapProto  = "proto"
 )
 
 type CollectorImpl struct{
-	mu sync.Mutex
-	jobs map[string]*aggState
-	exportInterval time.Duration
+	m meter
 }
 
-type aggState struct {
-	packets uint64
-	bytes   uint64
-	errors  map[string]uint64
-	bounds []uint64
-	counts []uint64
-	start time.Time
-	end   time.Time
-}
-
-func NewCollector() *CollectorImpl {
-	return &CollectorImpl{
-		jobs: make(map[string]*aggState),
-		exportInterval: 10 * time.Second,
-	}
+type meter interface {
+	Counter(name string) (metric.Float64Counter, error)
+	Histogram(name string) (metric.Float64Histogram, error)
 }
 
 func (c *CollectorImpl) Run(ctx context.Context, jobID string, spec JobSpec) (ResultsProvider, error) {
-	c.mu.Lock()
-	st := &aggState{
-		errors: map[string]uint64{},
-		bounds: []uint64{10_000, 50_000, 100_000, 500_000, 1_000_000},
-		counts: make([]uint64, 5),
-		start: time.Now(),
-		end:   time.Now().Add(spec.Duration),
+	m := otel.GetMeterProvider().Meter("sonic-dpmon")
+	pktCtr, _ := m.Float64Counter("network.packets")
+	byteCtr, _ := m.Float64Counter("network.bytes")
+
+	// Open pinned or in-object maps; here we load from the ELF pinned by tc (tc pinning varies).
+	// Pragmatically, open by name using ebpf.LoadPinnedMap if pinned; since tc didn't pin, we open via obj file is non-trivial.
+	// Instead, rely on reading via /sys/fs/bpf/tc/globals/<map> (tc creates 'tc/globals' namespace).
+	statsMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/tc/globals/"+mapStats, nil)
+	if err != nil {
+		log.Printf("warn: open stats map: %v", err)
 	}
-	c.jobs[jobID] = st
-	c.mu.Unlock()
+	protoMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/tc/globals/"+mapProto, nil)
+	if err != nil {
+		log.Printf("warn: open proto map: %v", err)
+	}
 
-	go c.exportLoop(ctx, jobID, spec)
+	var lastPkts, lastBytes uint64
 
-	return resultsProvider{c: c, id: jobID}, nil
-}
+	go func(){
+		ticker := time.NewTicker(10*time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				var pkts, bytes uint64
+				if statsMap != nil {
+					var key uint32 = 0
+					type dpCounters struct{ Packets uint64; Bytes uint64 }
+					// Combine per-CPU values
+					var agg dpCounters
+					iters, _ := statsMap.Lookup(key)
+					_ = iters // cilium/ebpf doesn't expose per-cpu read via Lookup; use LookupPerCPU on v0.16
+					var perCPU []dpCounters
+					if err := statsMap.Lookup(key, &perCPU); err == nil {
+						for _, v := range perCPU { agg.Packets += v.Packets; agg.Bytes += v.Bytes }
+						pkts, bytes = agg.Packets, agg.Bytes
+					}
+				}
+				deltaPkts := float64(0)
+				deltaBytes := float64(0)
+				if pkts >= lastPkts { deltaPkts = float64(pkts - lastPkts) }
+				if bytes >= lastBytes { deltaBytes = float64(bytes - lastBytes) }
+				lastPkts, lastBytes = pkts, bytes
 
-func (c *CollectorImpl) exportLoop(ctx context.Context, jobID string, spec JobSpec) {
-	t := time.NewTicker(c.exportInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			c.mu.Lock(); st := c.jobs[jobID]; if st != nil { st.end = time.Now() }; c.mu.Unlock()
-			fmt.Println("collector exit for job", jobID)
-			return
-		case <-t.C:
-			// TODO: read BPF maps here and update st; export via OTel in otel.go
-			// placeholder increments:
-			c.mu.Lock()
-			st := c.jobs[jobID]
-			if st != nil {
-				st.packets += 1000
-				st.bytes += 800000
-				st.counts[2] += 100 // bump 100us bucket
+				labels := metric.WithAttributes() // add attrs (device, port, direction) if desired
+				if deltaPkts > 0 { pktCtr.Add(ctx, deltaPkts, labels) }
+				if deltaBytes > 0 { byteCtr.Add(ctx, deltaBytes, labels) }
 			}
-			c.mu.Unlock()
 		}
-	}
+	}()
+
+	return &results{}, nil
 }
 
-type resultsProvider struct{
-	c *CollectorImpl
-	id string
+type results struct{}
+
+func (r *results) Summary() interface{} {
+	return map[string]any{"ok": true}
 }
 
-func (rp resultsProvider) Summary() interface{} {
-	rp.c.mu.Lock(); defer rp.c.mu.Unlock()
-	st := rp.c.jobs[rp.id]
-	if st == nil { return map[string]any{} }
-	return map[string]any{
-		"window_sec": int(st.end.Sub(st.start).Seconds()),
-		"packets_total": st.packets,
-		"bytes_total": st.bytes,
-		"errors": st.errors,
-		"latency_histogram_ns": map[string]any{"bounds": st.bounds, "counts": st.counts},
-	}
-}

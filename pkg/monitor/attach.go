@@ -2,35 +2,33 @@ package monitor
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 )
 
-// TC attaches eBPF object to tc clsact using the iproute2 `tc` command.
-// Requires: clsact qdisc and tc with bpf support in the container/host.
 type TC struct{}
 
-func runTc(args ...string) error {
-	cmd := exec.Command("tc", args...)
+func (t *TC) Attach(ifname string, spec JobSpec) (func() error, error) {
+	// Ensure clsact
+	_ = exec.Command("tc", "qdisc", "add", "dev", ifname, "clsact").Run()
+
+	// Load and attach via tc (bpf object expected at /bpf/tc_ingress.bpf.o inside container)
+	obj := "/bpf/tc_ingress.bpf.o"
+	if _, err := os.Stat(obj); err != nil {
+		return nil, fmt.Errorf("missing BPF object: %s", obj)
+	}
+	// Attach to ingress
+	cmd := exec.Command("tc", "filter", "replace", "dev", ifname, "ingress",
+		"prio", "1", "handle", "1", "bpf", "da", "obj", obj, "sec", "classifier")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("tc %v failed: %v: %s", args, err, string(out))
-	}
-	return nil
-}
-
-func (t *TC) Attach(ifname string, spec JobSpec) (func() error, error) {
-	// ensure clsact
-	_ = runTc("qdisc", "add", "dev", ifname, "clsact")
-	// Attach to ingress. If ResultDetail wants egress/both, add another filter.
-	obj := "/bpf/tc_ingress.bpf.o" // expect object baked or volume mounted at /bpf
-	if err := runTc("filter", "replace", "dev", ifname, "ingress", "prio", "1", "handle", "1", "bpf", "da", "obj", obj, "sec", "classifier"); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tc attach failed: %v: %s", err, string(out))
 	}
 	cleanup := func() error {
-		_ = runTc("filter", "del", "dev", ifname, "ingress")
-		_ = runTc("qdisc", "del", "dev", ifname, "clsact")
+		_ = exec.Command("tc", "filter", "del", "dev", ifname, "ingress").Run()
+		_ = exec.Command("tc", "qdisc", "del", "dev", ifname, "clsact").Run()
 		return nil
 	}
-	fmt.Printf("Attached tc+BPF on %s\n", ifname)
+	fmt.Printf("Attached tc program on %s (dir=%s)\n", ifname, spec.Direction)
 	return cleanup, nil
 }

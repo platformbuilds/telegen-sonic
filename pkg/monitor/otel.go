@@ -4,31 +4,25 @@ import (
 	"context"
 	"log"
 	"time"
-	gootel "go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/aggregation"
+	"go.opentelemetry.io/otel/sdk/metric/reader"
 )
 
-type OTelExporter struct {
-	mp *metric.MeterProvider
-}
-
-func NewOTelExporter(endpoint string) (*OTelExporter, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	exp, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithEndpoint(endpoint), otlpmetricgrpc.WithInsecure())
+func SetupOTel(endpoint string, interval time.Duration) (func(context.Context) error, error) {
+	exp, err := otlpmetricgrpc.New(context.Background(), otlpmetricgrpc.WithEndpoint(endpoint), otlpmetricgrpc.WithInsecure())
 	if err != nil { return nil, err }
-	mp := metric.NewMeterProvider(metric.WithReader(metric.NewPeriodicReader(exp)))
-	gootel.SetMeterProvider(mp)
-	return &OTelExporter{mp: mp}, nil
+	prd := reader.NewPeriodicReader(exp, reader.WithInterval(interval))
+	provider := metric.NewMeterProvider(
+		metric.WithReader(prd),
+		metric.WithView(metric.NewView(
+			metric.Instrument{Name: "*"},
+			metric.Stream{Aggregation: aggregation.Sum{}}, // defaults
+		)),
+	)
+	otel.SetMeterProvider(provider)
+	return provider.Shutdown, nil
 }
 
-func (o *OTelExporter) Shutdown(ctx context.Context) error {
-	if o.mp != nil { return o.mp.Shutdown(ctx) }
-	return nil
-}
-
-func (c *CollectorImpl) WireOTel(endpoint string) {
-	// TODO: register instruments and export counters/histograms from aggState
-	log.Println("OTel exporter endpoint set to", endpoint)
-}
