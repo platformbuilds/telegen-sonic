@@ -7,18 +7,20 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write    # create releases and upload assets
-  packages: write    # if you also use goreleaser to publish images
+  contents: write
+  packages: write
   id-token: write
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # needed for changelog from tags
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -26,13 +28,24 @@ jobs:
           go-version: '1.22.x'
           cache: true
 
+      - name: Install eBPF toolchain (if release needs prebuilt BPF or Docker)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libbpf-dev libelf-dev bpftool make pkg-config
+
+      - name: Prebuild eBPF objects (optional, safe if present)
+        if: ${{ hashFiles('bpf/Makefile') != '' }}
+        working-directory: bpf
+        run: make
+
       - name: Install GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           version: latest
           distribution: goreleaser
 
-      - name: Release
+      - name: Release with GoReleaser
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: goreleaser release --clean

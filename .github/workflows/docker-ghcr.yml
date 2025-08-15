@@ -9,8 +9,8 @@ on:
 
 permissions:
   contents: read
-  packages: write   # required to push to GHCR
-  id-token: write   # (optional) for future signing/provenance
+  packages: write
+  id-token: write
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -18,10 +18,21 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install eBPF toolchain (for building .bpf.o before image)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libbpf-dev libelf-dev bpftool make pkg-config
+
+      - name: Build eBPF objects
+        working-directory: bpf
+        run: make
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -46,7 +57,6 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha
-            # Set "latest" only for main branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
