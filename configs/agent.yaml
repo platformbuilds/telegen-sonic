@@ -1,0 +1,12 @@
+server:
+  listen: "127.0.0.1:8080"
+limits:
+  max_concurrent_jobs: 2
+  default_duration_sec: 120
+  default_sample_rate: 100
+  topk_flows: 1024
+export:
+  otlp_endpoint: "http://collector:4317"
+  interval_sec: 10
+security:
+  auth: "mtls"

@@ -1,0 +1,139 @@
+openapi: 3.1.0
+info:
+  title: SONiC DPMon API
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:8080/v1
+paths:
+  /monitor/jobs:
+    post:
+      summary: Start a monitor job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartJobRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartJobResponse'
+        '429':
+          description: Concurrency limit exceeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /monitor/jobs/{job_id}:
+    get:
+      summary: Get job status
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobStatus' }
+    delete:
+      summary: Stop a job
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StopJobResponse' }
+  /monitor/jobs/{job_id}/results:
+    get:
+      summary: Get job results
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: format
+          schema: { type: string, enum: [json] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobResults' }
+components:
+  schemas:
+    StartJobRequest:
+      type: object
+      properties:
+        port: { type: string }
+        direction: { type: string, enum: [ingress, egress, both] }
+        span_method: { type: string, enum: [span, erspan] }
+        vlan: { type: integer, nullable: true }
+        filters:
+          type: object
+          additionalProperties: true
+        sample_rate: { type: integer, minimum: 1 }
+        duration_sec: { type: integer, minimum: 1 }
+        otlp_export: { type: boolean }
+        result_detail: { type: string, enum: [summary, flows, pcaplike] }
+      required: [port, direction, span_method, duration_sec]
+    StartJobResponse:
+      type: object
+      properties:
+        job_id: { type: string }
+        status: { type: string }
+        interface: { type: string }
+    JobStatus:
+      type: object
+      properties:
+        job_id: { type: string }
+        status: { type: string }
+        started_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        port: { type: string }
+        interface: { type: string }
+    StopJobResponse:
+      type: object
+      properties:
+        job_id: { type: string }
+        status: { type: string }
+    JobResults:
+      type: object
+      properties:
+        window_sec: { type: integer }
+        packets_total: { type: integer }
+        bytes_total: { type: integer }
+        errors: { type: object, additionalProperties: { type: integer } }
+        top_flows:
+          type: array
+          items:
+            type: object
+            properties:
+              five_tuple: { type: string }
+              pkts: { type: integer }
+              bytes: { type: integer }
+        latency_histogram_ns:
+          type: object
+          properties:
+            bounds: { type: array, items: { type: integer } }
+            counts: { type: array, items: { type: integer } }
+        otel_export:
+          type: object
+          properties:
+            exported: { type: boolean }
+            endpoint: { type: string }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
