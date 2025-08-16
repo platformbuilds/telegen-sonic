@@ -4,6 +4,7 @@ package monitor
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,7 @@ type Supervisor struct {
 	maxConcurrent int32
 	activeJobs    int32
 
+	mu   sync.RWMutex // protects jobs map and fields of *Job
 	jobs map[string]*Job
 }
 
@@ -66,7 +68,14 @@ func (s *Supervisor) TryStartJob(req interface{}) (interface{}, int, error) {
 		return nil, 429, ErrConcurrencyLimit
 	}
 	id := uuid.NewString()
-	j := &Job{ID: id, Spec: spec, State: JobStarting, StartedAt: time.Now(), ExpiresAt: time.Now().Add(spec.Duration)}
+
+	j := &Job{
+		ID:        id,
+		Spec:      spec,
+		State:     JobStarting,
+		StartedAt: time.Now(),
+		ExpiresAt: time.Now().Add(spec.Duration),
+	}
 
 	ifname, mirCleanup, err := s.mir.Create(spec)
 	if err != nil {
@@ -84,36 +93,64 @@ func (s *Supervisor) TryStartJob(req interface{}) (interface{}, int, error) {
 
 	ctx, cancel := context.WithDeadline(context.Background(), j.ExpiresAt)
 	j.cancel = cancel
+
+	// store the job under lock
+	s.mu.Lock()
 	s.jobs[id] = j
+	s.mu.Unlock()
 
 	go func() {
 		defer s.release()
 		defer attCleanup()
 		defer mirCleanup()
-		j.State = JobRunning
-		prov, err := s.col.Run(ctx, id, spec)
-		_ = prov
-		_ = err // TODO: wire results
+
+		// mark running under lock
+		s.mu.Lock()
+		if jj, ok := s.jobs[id]; ok {
+			jj.State = JobRunning
+		}
+		s.mu.Unlock()
+
+		// run collector (ignore returned provider for now)
+		_, _ = s.col.Run(ctx, id, spec)
+
 		<-ctx.Done()
-		j.State = JobDone
+
+		// mark done under lock
+		s.mu.Lock()
+		if jj, ok := s.jobs[id]; ok {
+			jj.State = JobDone
+		}
+		s.mu.Unlock()
 	}()
 
 	return map[string]interface{}{"job_id": id, "status": "starting", "interface": ifname}, 201, nil
 }
 
 func (s *Supervisor) GetJob(id string) (interface{}, int, error) {
+	s.mu.RLock()
 	j, ok := s.jobs[id]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, 404, ErrJobNotFound
 	}
-	return map[string]interface{}{
-		"job_id": j.ID, "status": j.State, "started_at": j.StartedAt,
-		"expires_at": j.ExpiresAt, "port": j.Spec.Port, "interface": j.IfName,
-	}, 200, nil
+	// copy out the fields we need while holding the read lock
+	resp := map[string]interface{}{
+		"job_id":     j.ID,
+		"status":     j.State,
+		"started_at": j.StartedAt,
+		"expires_at": j.ExpiresAt,
+		"port":       j.Spec.Port,
+		"interface":  j.IfName,
+	}
+	s.mu.RUnlock()
+	return resp, 200, nil
 }
 
 func (s *Supervisor) StopJob(id string) (interface{}, int, error) {
+	s.mu.RLock()
 	j, ok := s.jobs[id]
+	s.mu.RUnlock()
 	if !ok {
 		return nil, 404, ErrJobNotFound
 	}
