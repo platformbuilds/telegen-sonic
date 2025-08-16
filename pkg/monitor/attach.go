@@ -8,12 +8,21 @@ import (
 
 type TC struct{}
 
+// getBPFObjPath lets tests (or ops) override the object path.
+// Default remains /bpf/tc_ingress.bpf.o so runtime behavior is unchanged.
+func getBPFObjPath() string {
+	if p := os.Getenv("TELEGEN_BPF_OBJ"); p != "" {
+		return p
+	}
+	return "/bpf/tc_ingress.bpf.o"
+}
+
 func (t *TC) Attach(ifname string, spec JobSpec) (func() error, error) {
 	// Ensure clsact
 	_ = exec.Command("tc", "qdisc", "add", "dev", ifname, "clsact").Run()
 
-	// Load and attach via tc (bpf object expected at /bpf/tc_ingress.bpf.o inside container)
-	obj := "/bpf/tc_ingress.bpf.o"
+	// Load and attach via tc (bpf object expected inside the container)
+	obj := getBPFObjPath()
 	if _, err := os.Stat(obj); err != nil {
 		return nil, fmt.Errorf("missing BPF object: %s", obj)
 	}
