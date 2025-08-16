@@ -10,25 +10,43 @@
 //
 // Notes:
 // - Requires vmlinux.h generated from /sys/kernel/btf/vmlinux (Makefile).
-// - No <linux/bpf.h> or bcc-style maps.
+// - No <linux/...> headers to avoid asm/types.h issues.
 // - Userspace must aggregate per-CPU map values for totals.
 
 #include "vmlinux.h"
-
-#include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
-// UAPI headers for protocol constants / structs
-#include <linux/if_ether.h>   // ETH_P_*
-#include <linux/if_vlan.h>    // struct vlan_hdr
-#include <linux/in.h>         // IPPROTO_*
-#include <linux/ip.h>         // struct iphdr
-#include <linux/ipv6.h>       // struct ipv6hdr
-#include <linux/icmpv6.h>     // ICMPv6 constants
-#include <linux/pkt_cls.h>    // TC_ACT_*
+/* ---- Local constants (avoid <linux/...> headers) ---- */
+#ifndef ETH_P_IP
+#define ETH_P_IP        0x0800
+#endif
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6      0x86DD
+#endif
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q     0x8100
+#endif
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD    0x88A8
+#endif
+#ifndef IPPROTO_ICMPV6
+#define IPPROTO_ICMPV6  58
+#endif
+#ifndef ETH_HLEN
+#define ETH_HLEN        14
+#endif
+#ifndef VLAN_HLEN
+#define VLAN_HLEN       4
+#endif
+#ifndef TC_ACT_OK
+#define TC_ACT_OK       0
+#endif
+#ifndef BPF_ANY
+#define BPF_ANY         0
+#endif
 
-// ---- Stats structures & keys ----
-
+/* ---- Stats structures & keys ---- */
 struct proto_stats {
     __u64 packets;
     __u64 bytes;
@@ -44,11 +62,11 @@ enum {
 
 struct if_proto_key {
     __u32 ifindex;
-    __u32 proto;   // one of IDX_*
+    __u32 proto;   /* one of IDX_* */
 };
 
-// ---- Maps ----
-// Per-CPU global proto stats
+/* ---- Maps ---- */
+/* Per-CPU global proto stats */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, IDX_MAX);
@@ -56,7 +74,7 @@ struct {
     __type(value, struct proto_stats);
 } stats_percpu SEC(".maps");
 
-// Per-CPU per-interface proto stats (bounded size; tune as needed)
+/* Per-CPU per-interface proto stats */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __uint(max_entries, 4096);
@@ -64,8 +82,7 @@ struct {
     __type(value, struct proto_stats);
 } if_stats_percpu SEC(".maps");
 
-// ---- Helpers ----
-
+/* ---- Bump helpers ---- */
 static __always_inline void bump_global(__u32 idx, __u32 bytes)
 {
     struct proto_stats *st = bpf_map_lookup_elem(&stats_percpu, &idx);
@@ -77,14 +94,10 @@ static __always_inline void bump_global(__u32 idx, __u32 bytes)
 
 static __always_inline void bump_if(__u32 ifindex, __u32 idx, __u32 bytes)
 {
-    struct if_proto_key k = {
-        .ifindex = ifindex,
-        .proto   = idx,
-    };
+    struct if_proto_key k = { .ifindex = ifindex, .proto = idx };
     struct proto_stats zero = {};
     struct proto_stats *st = bpf_map_lookup_elem(&if_stats_percpu, &k);
     if (!st) {
-        // Initialize an entry lazily
         bpf_map_update_elem(&if_stats_percpu, &k, &zero, BPF_ANY);
         st = bpf_map_lookup_elem(&if_stats_percpu, &k);
         if (!st)
@@ -101,23 +114,25 @@ static __always_inline void bump_all(__u32 ifindex, __u32 idx, __u32 bytes)
         bump_if(ifindex, idx, bytes);
 }
 
+/* ---- Parse Ethernet + VLAN, return L3 proto and next header pointer ---- */
 static __always_inline int parse_ethproto(void *data, void *data_end, __u16 *eth_proto, void **nh)
 {
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
+    /* Ensure we have Ethernet header */
+    if ((char *)data + ETH_HLEN > (char *)data_end)
         return -1;
 
-    __u16 proto = bpf_ntohs(eth->h_proto);
-    void *cursor = (void *)(eth + 1);
+    /* EtherType at offset 12 */
+    __u16 proto = bpf_ntohs(*(__be16 *)((char *)data + 12));
+    void *cursor = (char *)data + ETH_HLEN;
 
 #pragma clang loop unroll(full)
-    for (int i = 0; i < 2; i++) { // handle up to 2 VLAN tags
+    for (int i = 0; i < 2; i++) { /* handle up to 2 VLAN tags */
         if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
-            if ((char *)cursor + sizeof(struct vlan_hdr) > (char *)data_end)
+            if ((char *)cursor + VLAN_HLEN > (char *)data_end)
                 return -1;
-            struct vlan_hdr *vh = cursor;
-            proto = bpf_ntohs(vh->h_vlan_encapsulated_proto);
-            cursor = (char *)cursor + sizeof(struct vlan_hdr);
+            /* VLAN ethertype is at +2 from VLAN header start */
+            proto = bpf_ntohs(*(__be16 *)((char *)cursor + 2));
+            cursor = (char *)cursor + VLAN_HLEN;
         } else {
             break;
         }
@@ -128,8 +143,7 @@ static __always_inline int parse_ethproto(void *data, void *data_end, __u16 *eth
     return 0;
 }
 
-// ---- TC ingress program ----
-
+/* ---- TC ingress program ---- */
 SEC("tc")
 int tc_ingress(struct __sk_buff *skb)
 {
@@ -137,10 +151,8 @@ int tc_ingress(struct __sk_buff *skb)
     void *data_end = (void *)(long)skb->data_end;
     __u32 pkt_len = (__u32)((long)data_end - (long)data);
 
-    // Choose an ifindex for per-port stats. Prefer skb->ifindex; fallback to ingress_ifindex.
-    __u32 ifidx = skb->ifindex;
-    if (!ifidx)
-        ifidx = skb->ingress_ifindex;
+    /* Prefer skb->ifindex; fallback to ingress_ifindex */
+    __u32 ifidx = skb->ifindex ? skb->ifindex : skb->ingress_ifindex;
 
     __u16 proto = 0;
     void *nh = data;
@@ -151,24 +163,26 @@ int tc_ingress(struct __sk_buff *skb)
     }
 
     if (proto == ETH_P_IP) {
-        if ((char *)nh + sizeof(struct iphdr) > (char *)data_end) {
+        /* minimal IPv4 header is 20 bytes */
+        if ((char *)nh + 20 > (char *)data_end) {
             bump_all(ifidx, IDX_OTHER, pkt_len);
             return TC_ACT_OK;
         }
-        // IPv4
         bump_all(ifidx, IDX_IPV4, pkt_len);
         return TC_ACT_OK;
     }
 
     if (proto == ETH_P_IPV6) {
-        if ((char *)nh + sizeof(struct ipv6hdr) > (char *)data_end) {
+        /* fixed IPv6 header is 40 bytes */
+        if ((char *)nh + 40 > (char *)data_end) {
             bump_all(ifidx, IDX_OTHER, pkt_len);
             return TC_ACT_OK;
         }
-        struct ipv6hdr *ip6h = nh;
         bump_all(ifidx, IDX_IPV6, pkt_len);
 
-        if (ip6h->nexthdr == IPPROTO_ICMPV6) {
+        /* nexthdr field is byte 6 in IPv6 header */
+        __u8 nexthdr = *(__u8 *)((char *)nh + 6);
+        if (nexthdr == IPPROTO_ICMPV6) {
             bump_all(ifidx, IDX_ICMP6, pkt_len);
         }
         return TC_ACT_OK;
@@ -178,5 +192,5 @@ int tc_ingress(struct __sk_buff *skb)
     return TC_ACT_OK;
 }
 
-// Required license
+/* Required license */
 char LICENSE[] SEC("license") = "GPL";
