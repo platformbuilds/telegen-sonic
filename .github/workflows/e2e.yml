@@ -37,7 +37,7 @@ jobs:
     name: Create tag (manual, owner/admin only)
     runs-on: ubuntu-latest
     steps:
-      - name: Guard: only repository admins/owners may run releases
+      - name: "Guard: only repository admins/owners may run releases"
         uses: actions/github-script@v7
         with:
           script: |
@@ -223,7 +223,7 @@ jobs:
     name: Release after PR merge (owner/admin gate)
     runs-on: ubuntu-latest
     steps:
-      - name: Guard: merger must be admin/owner
+      - name: "Guard: merger must be admin/owner"
         uses: actions/github-script@v7
         with:
           script: |
