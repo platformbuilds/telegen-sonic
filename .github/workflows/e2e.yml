@@ -150,25 +150,61 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             const TAG = process.env.RELEASE_TAG;
-            const SAFE_TAG = TAG.replace(/\//g,'-');
+            const SAFE_TAG = TAG.replace(/\//g, '-');
 
-            // Read raw govuln output
-            let raw = fs.readFileSync('govuln.json','utf8').trim();
+            // Read raw govuln output (may contain banners / multiple JSONs)
+            const rawAll = fs.readFileSync('govuln.json', 'utf8');
 
-            // Try to extract only the JSON block (between first { and last })
-            const start = raw.indexOf('{');
-            const end   = raw.lastIndexOf('}');
-            if (start === -1 || end === -1) {
-              core.setFailed("govuln.json does not contain valid JSON object");
+            // Extract the FIRST complete JSON object (or array) via brace balancing,
+            // skipping junk and respecting string/escape semantics.
+            function extractFirstJson(txt) {
+              let start = -1;
+              let end = -1;
+              let depth = 0;
+              let inString = false;
+              let esc = false;
+              let opener = null; // '{' or '['
+              for (let i = 0; i < txt.length; i++) {
+                const ch = txt[i];
+
+                if (start === -1) {
+                  if (ch === '{' || ch === '[') {
+                    start = i;
+                    opener = ch;
+                    depth = 1;
+                    inString = false;
+                    esc = false;
+                  }
+                  continue;
+                }
+
+                if (inString) {
+                  if (esc) { esc = false; continue; }
+                  if (ch === '\\') { esc = true; continue; }
+                  if (ch === '"') { inString = false; continue; }
+                  continue;
+                }
+
+                // not inside a string
+                if (ch === '"') { inString = true; continue; }
+                if (ch === '{' || ch === '[') { depth++; continue; }
+                if (ch === '}' || ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+              }
+              if (start !== -1 && end !== -1) return txt.slice(start, end + 1);
+              return null;
+            }
+
+            let coreJson = extractFirstJson(rawAll);
+            if (!coreJson) {
+              core.setFailed('govuln.json does not contain a complete JSON object/array');
               return;
             }
-            raw = raw.slice(start, end+1);
 
             let doc;
             try {
-              doc = JSON.parse(raw);
+              doc = JSON.parse(coreJson);
             } catch (e) {
-              core.setFailed(`Unable to parse govuln.json: ${e.message}`);
+              core.setFailed(`Unable to parse govuln.json (sanitized): ${e.message}`);
               return;
             }
 
@@ -179,13 +215,13 @@ jobs:
             fs.mkdirSync('.release', { recursive: true });
             fs.writeFileSync('.release/tag', TAG);
 
-            // Save pretty JSON report
-            const outDir = path.join('reports','govulncheck');
+            // Save pretty JSON report to a deterministic path
+            const outDir = path.join('reports', 'govulncheck');
             fs.mkdirSync(outDir, { recursive: true });
             const outPath = path.join(outDir, `${SAFE_TAG}.json`);
             fs.writeFileSync(outPath, JSON.stringify(doc, null, 2), 'utf8');
 
-            // Build README section cleanly
+            // Build README section safely (line-by-line; pure ASCII)
             const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
             const lines = [
               '<!-- GOVULNCHECK-START -->',
@@ -204,10 +240,9 @@ jobs:
             ];
             const section = lines.join('\n');
 
-            // Insert/replace in README.md
             const startMarker = '<!-- GOVULNCHECK-START -->';
             const endMarker   = '<!-- GOVULNCHECK-END -->';
-            let readme = fs.existsSync('README.md') ? fs.readFileSync('README.md','utf8') : '';
+            let readme = fs.existsSync('README.md') ? fs.readFileSync('README.md', 'utf8') : '';
             if (readme.includes(startMarker) && readme.includes(endMarker)) {
               const pre  = readme.slice(0, readme.indexOf(startMarker));
               const post = readme.slice(readme.indexOf(endMarker) + endMarker.length);
