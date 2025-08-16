@@ -29,7 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 # --------------------------------------------------------------------
-# PATH A: Manual dispatch -> create tag, run govulncheck, open PR
+# PATH A: Manual dispatch -> create tag, run govulncheck (pure JSON), open PR
 # --------------------------------------------------------------------
 jobs:
   create-tag:
@@ -44,19 +44,9 @@ jobs:
             const owner = context.repo.owner.toLowerCase();
             const repo  = context.repo.repo;
             const actor = context.actor.toLowerCase();
-
-            // owner org == actor user (personal repo) — allow
-            if (actor === owner) {
-              core.info(`Actor ${actor} is repo owner ${owner}; allowed.`);
-              return;
-            }
-            // otherwise require admin permission
-            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner, repo, username: context.actor
-            });
-            if (data.permission !== 'admin') {
-              core.setFailed('Only repository admins/owners may run the release workflow.');
-            }
+            if (actor === owner) return; // personal repo case
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: context.actor });
+            if (data.permission !== 'admin') core.setFailed('Only repository admins/owners may run the release workflow.');
 
       - name: Validate tag format
         run: |
@@ -66,7 +56,7 @@ jobs:
             exit 1
           fi
 
-      - name: Create git tag (lightweight) if missing
+      - name: Create git tag if missing
         uses: actions/github-script@v7
         with:
           script: |
@@ -78,11 +68,7 @@ jobs:
               core.info(`Tag ${tag} already exists.`);
             } catch (e) {
               if (e.status !== 404) throw e;
-              await github.rest.git.createRef({
-                owner, repo,
-                ref: `refs/tags/${tag}`,
-                sha: context.sha
-              });
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: context.sha });
               core.info(`Created refs/tags/${tag}`);
             }
 
@@ -93,13 +79,11 @@ jobs:
             const tag   = process.env.RELEASE_TAG;
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-
             try {
               await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-              core.info(`Release for ${tag} already exists.`);
             } catch (e) {
               if (e.status !== 404) throw e;
-              const res = await github.rest.repos.createRelease({
+              await github.rest.repos.createRelease({
                 owner, repo,
                 tag_name: tag,
                 target_commitish: context.sha,
@@ -109,7 +93,6 @@ jobs:
                 prerelease: false,
                 generate_release_notes: true
               });
-              core.info(`Created draft release id=${res.data.id} for tag ${tag}.`);
             }
 
   govulncheck:
@@ -131,17 +114,18 @@ jobs:
       - name: Verify modules resolve (RO mode)
         run: go list ./... >/dev/null
 
-      - name: Run govulncheck (JSON)
-        uses: golang/govulncheck-action@v1
-        with:
-          go-version-input: '1.23'
-          go-package: ./...
-          output-format: json
-          output-file: govuln.json
-          check-latest: true
-          cache: true
+      # ---- Run govulncheck directly to guarantee PURE JSON ----
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
-      # Robust, jq-free parsing & write-outs
+      - name: Run govulncheck (pure JSON)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(go env GOPATH)/bin/govulncheck"
+          # write ONLY JSON to file
+          "$BIN" -format=json ./... > govuln.json
+
       - name: Analyze report and stage README/report files
         id: analyze
         uses: actions/github-script@v7
@@ -150,80 +134,32 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             const TAG = process.env.RELEASE_TAG;
-            const SAFE_TAG = TAG.replace(/\//g, '-');
+            const SAFE_TAG = TAG.replace(/\//g,'-');
 
-            // Read raw govuln output (may contain banners / multiple JSONs)
-            const rawAll = fs.readFileSync('govuln.json', 'utf8');
-
-            // Extract the FIRST complete JSON object (or array) via brace balancing,
-            // skipping junk and respecting string/escape semantics.
-            function extractFirstJson(txt) {
-              let start = -1;
-              let end = -1;
-              let depth = 0;
-              let inString = false;
-              let esc = false;
-              let opener = null; // '{' or '['
-              for (let i = 0; i < txt.length; i++) {
-                const ch = txt[i];
-
-                if (start === -1) {
-                  if (ch === '{' || ch === '[') {
-                    start = i;
-                    opener = ch;
-                    depth = 1;
-                    inString = false;
-                    esc = false;
-                  }
-                  continue;
-                }
-
-                if (inString) {
-                  if (esc) { esc = false; continue; }
-                  if (ch === '\\') { esc = true; continue; }
-                  if (ch === '"') { inString = false; continue; }
-                  continue;
-                }
-
-                // not inside a string
-                if (ch === '"') { inString = true; continue; }
-                if (ch === '{' || ch === '[') { depth++; continue; }
-                if (ch === '}' || ch === ']') { depth--; if (depth === 0) { end = i; break; } }
-              }
-              if (start !== -1 && end !== -1) return txt.slice(start, end + 1);
-              return null;
-            }
-
-            let coreJson = extractFirstJson(rawAll);
-            if (!coreJson) {
-              core.setFailed('govuln.json does not contain a complete JSON object/array');
-              return;
-            }
-
+            // read pure JSON produced in the previous step
             let doc;
             try {
-              doc = JSON.parse(coreJson);
+              doc = JSON.parse(fs.readFileSync('govuln.json','utf8'));
             } catch (e) {
-              core.setFailed(`Unable to parse govuln.json (sanitized): ${e.message}`);
+              core.setFailed(`Unable to parse govuln.json: ${e.message}`);
               return;
             }
-
             const count = Array.isArray(doc.vulns) ? doc.vulns.length : 0;
             core.setOutput('count', String(count));
 
-            // Persist tag for later jobs
+            // persist tag for path-B
             fs.mkdirSync('.release', { recursive: true });
             fs.writeFileSync('.release/tag', TAG);
 
-            // Save pretty JSON report to a deterministic path
-            const outDir = path.join('reports', 'govulncheck');
+            // save pretty JSON
+            const outDir = path.join('reports','govulncheck');
             fs.mkdirSync(outDir, { recursive: true });
             const outPath = path.join(outDir, `${SAFE_TAG}.json`);
             fs.writeFileSync(outPath, JSON.stringify(doc, null, 2), 'utf8');
 
-            // Build README section safely (line-by-line; pure ASCII)
+            // update README section
             const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-            const lines = [
+            const section = [
               '<!-- GOVULNCHECK-START -->',
               '### govulncheck',
               '',
@@ -237,12 +173,11 @@ jobs:
               '_This section is auto-updated by the e2e release workflow._',
               '<!-- GOVULNCHECK-END -->',
               ''
-            ];
-            const section = lines.join('\n');
+            ].join('\n');
 
             const startMarker = '<!-- GOVULNCHECK-START -->';
             const endMarker   = '<!-- GOVULNCHECK-END -->';
-            let readme = fs.existsSync('README.md') ? fs.readFileSync('README.md', 'utf8') : '';
+            let readme = fs.existsSync('README.md') ? fs.readFileSync('README.md','utf8') : '';
             if (readme.includes(startMarker) && readme.includes(endMarker)) {
               const pre  = readme.slice(0, readme.indexOf(startMarker));
               const post = readme.slice(readme.indexOf(endMarker) + endMarker.length);
@@ -253,25 +188,35 @@ jobs:
             }
             fs.writeFileSync('README.md', readme, 'utf8');
 
+      # Use a PAT if available (needed when org setting blocks Actions from creating PRs)
+      - name: Pick token for PR
+        id: picktok
+        run: |
+          if [ -n "${{ secrets.BOT_TOKEN }}" ]; then
+            echo "token=${{ secrets.BOT_TOKEN }}" >> $GITHUB_OUTPUT
+          else
+            echo "token=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create PR with report & README
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "chore(govulncheck): add report for ${{ env.RELEASE_TAG }} and update README"
           branch: "chore/govulncheck-${{ env.RELEASE_TAG && env.RELEASE_TAG != '' && env.RELEASE_TAG || github.run_id }}-${{ github.run_id }}"
-          # Requirement: PR title must start with [vulncheck]
           title: "[vulncheck] report for ${{ env.RELEASE_TAG }}"
           body: |
             This PR adds the **govulncheck** report for `${{ env.RELEASE_TAG }}` and updates the README summary section.
-
             Findings: `${{ steps.analyze.outputs.count }}`
           labels: |
             security
             automated-pr
           delete-branch: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.picktok.outputs.token }}
+          author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
 
 # --------------------------------------------------------------------
-# PATH B: PR merged -> build, test, image + binaries -> release
+# PATH B: PR merged -> build, tests, image + binaries -> finalize release
 # --------------------------------------------------------------------
   release-on-merge:
     # Run only when a PR was merged AND its title starts with "[vulncheck]"
@@ -286,18 +231,11 @@ jobs:
             const owner  = context.repo.owner;
             const repo   = context.repo.repo;
             const number = context.payload.pull_request.number;
-
-            // refresh PR to get merged_by reliably
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
             if (!pr.merged) core.setFailed('PR is not merged');
-
             const merger = (pr.merged_by && pr.merged_by.login) ? pr.merged_by.login : context.actor;
-            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner, repo, username: merger
-            });
-            if (data.permission !== 'admin') {
-              core.setFailed(`User ${merger} lacks admin permissions; refusing to release.`);
-            }
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: merger });
+            if (data.permission !== 'admin') core.setFailed(`User ${merger} lacks admin permissions; refusing to release.`);
 
       - uses: actions/checkout@v4
         with:
@@ -321,7 +259,7 @@ jobs:
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "SAFE_TAG=${TAG//\//-}" >> "$GITHUB_ENV"
 
-      - name: Ensure tag exists (from dispatch path)
+      - name: Ensure tag exists
         uses: actions/github-script@v7
         with:
           script: |
@@ -331,7 +269,7 @@ jobs:
             try {
               await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
             } catch (e) {
-              core.setFailed(`refs/tags/${tag} does not exist. Run dispatch path first.`);
+              core.setFailed(`refs/tags/${tag} does not exist. Run the dispatch path first.`);
             }
 
       - name: Setup Go
@@ -381,7 +319,7 @@ jobs:
           go build ./...
           go test -race -count=1 ./...
 
-      # -------- Docker release (image tag exactly matches release tag) --------
+      # ---- Docker image (tag EXACTLY == release tag) ----
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -418,7 +356,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # -------- GoReleaser (binaries) with the same tag --------
+      # ---- GoReleaser (binaries) with the same tag) ----
       - name: GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
