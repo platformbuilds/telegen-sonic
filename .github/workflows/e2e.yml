@@ -1,6 +1,7 @@
 name: e2e
 
 on:
+  # 1) Owner/admin manually kicks off a release scan + PR with a tag
   workflow_dispatch:
     inputs:
       tag:
@@ -8,27 +9,35 @@ on:
         required: true
         type: string
 
+  # 2) Actual release runs ONLY after the govulncheck PR is merged
+  pull_request_target:
+    types: [closed]
+
 permissions:
   contents: write
   packages: write
   id-token: write
+  pull-requests: write
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
   GO_VERSION: '1.23.x'
-  GOFLAGS: -mod=readonly
   RELEASE_TAG: ${{ inputs.tag }}
 
 concurrency:
-  group: e2e-release-${{ github.run_id }}
+  group: e2e-${{ github.ref || github.run_id }}
   cancel-in-progress: false
 
+# --------------------------------------------------------------------
+# PATH A: Manual dispatch -> create tag, run govulncheck, open PR
+# --------------------------------------------------------------------
 jobs:
   create-tag:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     name: Create tag (manual, owner/admin only)
     runs-on: ubuntu-latest
     steps:
-      - name: "Guard: only repository admins/owners may run releases"
+      - name: Guard: only repository admins/owners may run releases
         uses: actions/github-script@v7
         with:
           script: |
@@ -36,18 +45,18 @@ jobs:
             const repo  = context.repo.repo;
             const actor = context.actor.toLowerCase();
 
-            if (owner === actor) {
-              core.info(`Actor ${actor} is the repo owner (${owner}); allowed.`);
+            if (actor === owner) {
+              core.info(`Actor ${actor} is repo owner ${owner}; allowed.`);
               return;
             }
             const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
               owner, repo, username: context.actor
             });
             if (data.permission !== 'admin') {
-              core.setFailed('Only repository admins/owners may run release workflow.');
+              core.setFailed('Only repository admins/owners may run the release workflow.');
             }
 
-      - name: "Validate tag format"
+      - name: Validate tag format
         run: |
           TAG="${{ env.RELEASE_TAG }}"
           if [[ ! "$TAG" =~ ^release/mark-v[0-9]+-[0-9]+-[0-9]+$ ]]; then
@@ -55,28 +64,25 @@ jobs:
             exit 1
           fi
 
-      - name: "Create git tag (lightweight) if missing"
-        id: createref
+      - name: Create git tag (lightweight) if missing
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = process.env.RELEASE_TAG;
+            const tag   = process.env.RELEASE_TAG;
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
             try {
               await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
               core.info(`Tag ${tag} already exists.`);
-              core.setOutput('created', 'false');
             } catch (e) {
               if (e.status !== 404) throw e;
               const sha = context.sha;
               await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
               core.info(`Created refs/tags/${tag} -> ${sha}`);
-              core.setOutput('created', 'true');
             }
 
-      - name: "Ensure draft GitHub Release exists for the tag"
+      - name: Ensure draft GitHub Release exists
         uses: actions/github-script@v7
         with:
           script: |
@@ -105,7 +111,8 @@ jobs:
             core.info(`Created draft release id=${res.data.id} for tag ${tag}.`)
 
   govulncheck:
-    name: Security gate (govulncheck FIRST)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Security gate (govulncheck FIRST) + PR
     runs-on: ubuntu-latest
     needs: [create-tag]
     steps:
@@ -122,8 +129,12 @@ jobs:
       - name: Verify modules resolve (RO mode)
         run: go list ./... >/dev/null
 
+      - name: Install jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
       - name: Run govulncheck (JSON)
-        id: vuln
         uses: golang/govulncheck-action@v1
         with:
           go-version-input: '1.23'
@@ -133,33 +144,23 @@ jobs:
           check-latest: true
           cache: true
 
-      # Compute count cleanly; DO NOT echo anything to $GITHUB_OUTPUT except KEY=VAL
       - name: Compute findings count (no fail)
         id: count
+        shell: bash
         run: |
-          sudo apt-get update -y && sudo apt-get install -y jq
+          set -euo pipefail
           COUNT="$(jq -r '.vulns | length' govuln.json)"
-          printf "count=%s\n" "$COUNT" >> "$GITHUB_OUTPUT"
-          printf "GOVULN_COUNT=%s\n" "$COUNT" >> "$GITHUB_ENV"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "GOVULN_COUNT=${COUNT}" >> "$GITHUB_ENV"
 
-      - name: Fail on findings (hard gate)
-        run: |
-          if [ "${{ steps.count.outputs.count }}" -gt 0 ]; then
-            echo "❌ Vulnerabilities detected by govulncheck: ${{ steps.count.outputs.count }}"
-            exit 1
-          fi
-          echo "✅ No vulnerabilities found"
-
-      # Always prepare the report & PR for visibility, even if the gate failed
-      - name: Prepare report & README update
-        if: ${{ always() }}
+      - name: Prepare report, README section, and .release/tag
         run: |
           set -euxo pipefail
-          sudo apt-get install -y jq
           TAG="${{ env.RELEASE_TAG }}"
           SAFE_TAG="${TAG//\//-}"
-          mkdir -p reports/govulncheck
+          mkdir -p reports/govulncheck .release
           jq '.' govuln.json > "reports/govulncheck/${SAFE_TAG}.json"
+          echo "$TAG" > .release/tag
 
           COUNT="${GOVULN_COUNT:-0}"
           DATE="$(date -u +'%Y-%m-%d %H:%M:%SZ')"
@@ -195,7 +196,6 @@ jobs:
           fi
 
       - name: Create PR with report & README
-        if: ${{ always() }}
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "chore(govulncheck): add report for ${{ env.RELEASE_TAG }} and update README"
@@ -207,16 +207,71 @@ jobs:
           labels: |
             security
             automated-pr
-          signoff: false
           delete-branch: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  build-test:
-    name: Build & Test (runs only if govulncheck passed)
+# --------------------------------------------------------------------
+# PATH B: PR merged -> build, test, image + binaries -> release
+# --------------------------------------------------------------------
+  release-on-merge:
+    if: >
+      ${{
+        github.event_name == 'pull_request_target' &&
+        github.event.pull_request.merged == true &&
+        startsWith(github.event.pull_request.head.ref, 'chore/govulncheck-')
+      }}
+    name: Release after PR merge (owner/admin gate)
     runs-on: ubuntu-latest
-    needs: [govulncheck]
     steps:
+      - name: Guard: merger must be admin/owner
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const merger = context.payload.pull_request.merged_by?.login;
+            if (!merger) core.setFailed('Cannot detect merger.');
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner, repo, username: merger
+            });
+            if (data.permission !== 'admin') {
+              core.setFailed(`User ${merger} lacks admin permissions; refusing to release.`);
+            }
+
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Read tag from .release/tag
+        id: tagfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f .release/tag ]; then
+            echo "Missing .release/tag in merged commit." >&2
+            exit 1
+          fi
+          TAG="$(cat .release/tag)"
+          if [[ ! "$TAG" =~ ^release/mark-v[0-9]+-[0-9]+-[0-9]+$ ]]; then
+            echo "Tag in .release/tag has wrong format: $TAG" >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "SAFE_TAG=${TAG//\//-}" >> "$GITHUB_ENV"
+
+      - name: Ensure tag exists (from dispatch path)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag   = process.env.RELEASE_TAG;
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            } catch (e) {
+              core.setFailed(`refs/tags/${tag} does not exist. Run dispatch path first.`);
+            }
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -260,28 +315,12 @@ jobs:
           go mod tidy
           go mod download all
 
-      - name: Build
-        run: go build ./...
-
-      - name: Test (race)
-        run: go test -race -count=1 ./...
-
-      - name: Verify static builds (sanity)
-        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./...
-
-  docker:
-    name: Build & Push Docker (tag == release tag)
-    runs-on: ubuntu-latest
-    needs: [build-test]
-    environment:
-      name: release
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Compute SAFE_TAG (slash -> dash)
+      - name: Build & Test (race)
         run: |
-          echo "SAFE_TAG=${RELEASE_TAG//\//-}" >> "$GITHUB_ENV"
+          go build ./...
+          go test -race -count=1 ./...
 
+      # -------- Docker release (image tag exactly matches release tag) --------
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -306,7 +345,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.RELEASE_TAG }}
 
-      - name: Build & push
+      - name: Build & push image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -318,43 +357,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  goreleaser:
-    name: GoReleaser (binaries, exact tag)
-    runs-on: ubuntu-latest
-    needs: [build-test]
-    environment:
-      name: release
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Ensure bpftool & prebuild BPF
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y clang llvm make gcc libelf-dev libbpf-dev pkg-config
-          KREL="$(uname -r)"
-          sudo apt-get install -y "linux-tools-${KREL}" linux-tools-common || true
-          BPFOOL="$(command -v bpftool || true)"
-          if [ -z "$BPFOOL" ] && [ -x "/usr/lib/linux-tools-${KREL}/bpftool" ]; then BPFOOL="/usr/lib/linux-tools-${KREL}/bpftool"; fi
-          if [ -z "$BPFOOL" ]; then echo "bpftool not found"; exit 1; fi
-          echo "BPFOOL=$BPFOOL" >> "$GITHUB_ENV"
-          (cd bpf && BPFOOL="$BPFOOL" make)
-
-      - name: Sync modules
-        run: |
-          go env -w GOPROXY=https://proxy.golang.org,direct
-          go mod tidy
-          go mod download all
-
-      - name: GoReleaser (tag from input)
+      # -------- GoReleaser (binaries) with the same tag --------
+      - name: GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           version: latest
