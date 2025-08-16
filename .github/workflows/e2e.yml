@@ -172,17 +172,114 @@ jobs:
     needs: [build-test]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: "Verify modules resolve (RO mode)"
+
+      - name: Verify modules resolve (RO mode)
         run: go list ./... >/dev/null
-      - name: "govulncheck"
+
+      - name: Run govulncheck (JSON)
+        id: vuln
         uses: golang/govulncheck-action@v1
         with:
           go-version-input: '1.23'
-          vulncheck-flags: ./...
+          go-package: ./...
+          output-format: json
+          output-file: govuln.json
+          check-latest: true
+          cache: true
+
+      - name: Parse & fail on findings
+        id: parse
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq
+          COUNT="$(jq '.vulns | length' govuln.json)"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "❌ Vulnerabilities detected:"
+            jq '.vulns' govuln.json
+            # Still continue to publish the report/PR for visibility
+            exit 1
+          fi
+          echo "✅ No vulnerabilities found"
+
+      # Save pretty JSON and update README in a PR (always runs; even if previous step failed)
+      - name: Prepare report & README update
+        if: ${{ always() }}
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y jq
+          TAG="${{ env.RELEASE_TAG }}"
+          SAFE_TAG="${TAG//\//-}"
+          mkdir -p reports/govulncheck
+          jq '.' govuln.json > "reports/govulncheck/${SAFE_TAG}.json"
+
+          COUNT="${{ steps.parse.outputs.count || '0' }}"
+          DATE="$(date -u +'%Y-%m-%d %H:%M:%SZ')"
+          LINK="reports/govulncheck/${SAFE_TAG}.json"
+
+          # Build markdown block
+          mkdir -p .tmp
+          cat > .tmp/govul-summary.md <<'EOF'
+          <!-- GOVULNCHECK-START -->
+          ### govulncheck
+
+          | Field | Value |
+          |------:|:------|
+          | Tag | **${TAG}** |
+          | Scan Time (UTC) | ${DATE} |
+          | Findings | **${COUNT}** |
+          | Full Report | [${LINK}](${LINK}) |
+
+          _This section is auto-updated by the e2e release workflow._
+          <!-- GOVULNCHECK-END -->
+          EOF
+
+          # Replace or append the README section
+          if grep -q '<!-- GOVULNCHECK-START -->' README.md; then
+            awk 'BEGIN{p=1}
+                 /<!-- GOVULNCHECK-START -->/{p=0}
+                 { if(p) print }
+                 /<!-- GOVULNCHECK-END -->/{print system("cat .tmp/govul-summary.md"); p=1 }' README.md > README.md.new || true
+            # The awk trick above prints system() exit code; safer to do a simpler replace with sed if available:
+            if [ ! -s README.md.new ]; then
+              # Fallback sed replace (GNU sed)
+              START='<!-- GOVULNCHECK-START -->'
+              END='<!-- GOVULNCHECK-END -->'
+              sed -n "1,/${START}/p" README.md > README.md.head || true
+              sed -n "/${END}/,\$p" README.md > README.md.tail || true
+              cat README.md.head .tmp/govul-summary.md README.md.tail > README.md.new
+              rm -f README.md.head README.md.tail
+            fi
+            mv README.md.new README.md
+          else
+            printf "\n%s\n" >> README.md
+            cat .tmp/govul-summary.md >> README.md
+          fi
+
+      - name: Create PR with report & README
+        if: ${{ always() }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(govulncheck): add report for ${{ env.RELEASE_TAG }} and update README"
+          branch: "chore/govulncheck-${{ env.SAFE_TAG || env.RELEASE_TAG }}-${{ github.run_id }}"
+          title: "govulncheck: report for ${{ env.RELEASE_TAG }}"
+          body: |
+            This PR adds the **govulncheck** report for `${{ env.RELEASE_TAG }}` and updates the README summary section.
+            - JSON: `reports/govulncheck/${{ env.SAFE_TAG || env.RELEASE_TAG }}.json`
+            - Findings: `${{ steps.parse.outputs.count || '0' }}`
+          labels: |
+            security
+            automated-pr
+          signoff: false
+          delete-branch: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # 3) Docker image publish with EXACT tag (sanitized for Docker)
   docker:
