@@ -152,8 +152,18 @@ jobs:
             const TAG = process.env.RELEASE_TAG;
             const SAFE_TAG = TAG.replace(/\//g,'-');
 
-            // read & parse JSON safely
-            const raw = fs.readFileSync('govuln.json','utf8');
+            // Read raw govuln output
+            let raw = fs.readFileSync('govuln.json','utf8').trim();
+
+            // Try to extract only the JSON block (between first { and last })
+            const start = raw.indexOf('{');
+            const end   = raw.lastIndexOf('}');
+            if (start === -1 || end === -1) {
+              core.setFailed("govuln.json does not contain valid JSON object");
+              return;
+            }
+            raw = raw.slice(start, end+1);
+
             let doc;
             try {
               doc = JSON.parse(raw);
@@ -161,46 +171,52 @@ jobs:
               core.setFailed(`Unable to parse govuln.json: ${e.message}`);
               return;
             }
+
             const count = Array.isArray(doc.vulns) ? doc.vulns.length : 0;
             core.setOutput('count', String(count));
 
-            // write .release/tag
+            // Persist tag for later jobs
             fs.mkdirSync('.release', { recursive: true });
             fs.writeFileSync('.release/tag', TAG);
 
-            // write pretty report
+            // Save pretty JSON report
             const outDir = path.join('reports','govulncheck');
             fs.mkdirSync(outDir, { recursive: true });
             const outPath = path.join(outDir, `${SAFE_TAG}.json`);
             fs.writeFileSync(outPath, JSON.stringify(doc, null, 2), 'utf8');
 
-            // update README section
+            // Build README section cleanly
             const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-            const section =
-                `<!-- GOVULNCHECK-START -->
-                    ### govulncheck
-                    | Field | Value |
-                    |------:|:------|
-                    | Tag | **${TAG}** |
-                    | Scan Time (UTC) | ${date} |
-                    | Findings | **${count}** |
-                    | Full Report | [${outPath}](${outPath}) |
-                    _This section is auto-updated by the e2e release workflow._
-                    <!-- GOVULNCHECK-END -->
-                `;
-            const readme = fs.existsSync('README.md') ? fs.readFileSync('README.md','utf8') : '';
-            const start = '<!-- GOVULNCHECK-START -->';
-            const end   = '<!-- GOVULNCHECK-END -->';
+            const lines = [
+              '<!-- GOVULNCHECK-START -->',
+              '### govulncheck',
+              '',
+              '| Field | Value |',
+              '|------:|:------|',
+              `| Tag | **${TAG}** |`,
+              `| Scan Time (UTC) | ${date} |`,
+              `| Findings | **${count}** |`,
+              `| Full Report | [${outPath}](${outPath}) |`,
+              '',
+              '_This section is auto-updated by the e2e release workflow._',
+              '<!-- GOVULNCHECK-END -->',
+              ''
+            ];
+            const section = lines.join('\n');
 
-            let next;
-            if (readme.includes(start) && readme.includes(end)) {
-              const pre  = readme.split(start)[0];
-              const post = readme.split(end).slice(1).join(end);
-              next = pre + section + post;
+            // Insert/replace in README.md
+            const startMarker = '<!-- GOVULNCHECK-START -->';
+            const endMarker   = '<!-- GOVULNCHECK-END -->';
+            let readme = fs.existsSync('README.md') ? fs.readFileSync('README.md','utf8') : '';
+            if (readme.includes(startMarker) && readme.includes(endMarker)) {
+              const pre  = readme.slice(0, readme.indexOf(startMarker));
+              const post = readme.slice(readme.indexOf(endMarker) + endMarker.length);
+              readme = pre + section + post;
             } else {
-              next = readme + '\n' + section + '\n';
+              if (readme.length && !readme.endsWith('\n')) readme += '\n';
+              readme += section;
             }
-            fs.writeFileSync('README.md', next, 'utf8');
+            fs.writeFileSync('README.md', readme, 'utf8');
 
       - name: Create PR with report & README
         uses: peter-evans/create-pull-request@v6
