@@ -33,3 +33,6 @@ go.work.sum
 
 # Zip files
 *.zip
+
+# backup files
+*.bak
