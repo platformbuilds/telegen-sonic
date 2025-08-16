@@ -21,3 +21,5 @@ COPY --from=gobuild /src/bin/telegen-sonic /telegen-sonic
 COPY --from=bpf /src/tc_ingress.bpf.o /bpf/tc_ingress.bpf.o
 USER 65532:65532
 ENTRYPOINT ["/agent"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+  CMD /agent --healthcheck || exit 1

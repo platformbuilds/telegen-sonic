@@ -9,7 +9,9 @@ import (
 	"github.com/platformbuilds/telegen-sonic/pkg/api"
 )
 
-// BPFCollectorAdapter satisfies the Supervisor's Collector interface by delegating to MetricsCollector.
+// BPFCollectorAdapter satisfies the Supervisor's Collector interface by
+// delegating to MetricsCollector. Since the collector is started globally
+// in main.go, Run is a no-op to avoid double-starting it.
 type BPFCollectorAdapter struct {
 	mc *MetricsCollector
 }
@@ -23,8 +25,9 @@ type noopResults struct{}
 
 func (noopResults) Summary() interface{} { return map[string]any{} }
 
+// Run: no-op now that the global collector is already running.
+// We could record jobID/spec for future per-job summaries if needed.
 func (a *BPFCollectorAdapter) Run(ctx context.Context, jobID string, spec JobSpec) (ResultsProvider, error) {
-	go func() { _ = a.mc.Start(ctx) }()
 	return noopResults{}, nil
 }
 

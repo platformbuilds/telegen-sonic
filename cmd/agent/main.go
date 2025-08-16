@@ -13,6 +13,12 @@ import (
 	"github.com/platformbuilds/telegen-sonic/pkg/monitor"
 )
 
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = ""
+)
+
 func main() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
@@ -43,24 +49,30 @@ func main() {
 		log.Printf("warning: could not open pinned maps: %v", err)
 	}
 
-	// 3) Metrics collector + adapter (implements Supervisor's Collector interface)
+	// 3) Metrics collector (runs globally in this process)
 	mc, err := monitor.NewMetricsCollector(meter, statsMap, ifStatsMap, 5*time.Second)
 	if err != nil {
 		log.Fatalf("collector init failed: %v", err)
 	}
+	// Start the collector in the background so this single binary does API + metrics
+	go func() {
+		if err := mc.Start(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("metrics collector stopped with error: %v", err)
+		}
+	}()
+
+	// If Supervisor needs a Collector impl, wrap the already-running metrics collector.
 	col := monitor.NewBPFCollector(mc)
 
-	// 4) Your providers (replace with your real implementations if different)
+	// 4) Your providers (replace with real implementations if different)
 	mir := &monitor.Mirror{} // implements MirrorProvider
 	att := &monitor.TC{}     // implements AttachProvider
 
-	// 5) Supervisor (implements api.Core) — pass it straight to the API handlers
-	sup := monitor.NewSupervisor(mir, att, col, 2) // Supervisor
-
-	// Use the adapter (implements api.Core)
+	// 5) Supervisor and API wiring
+	sup := monitor.NewSupervisor(mir, att, col, 2)
 	core := &monitor.CoreAdapter{S: sup}
 
-	h := &api.Handlers{Core: core} // api.Core satisfied
+	h := &api.Handlers{Core: core}
 	r := api.NewRouter(h)
 
 	log.Println("listening on 127.0.0.1:8080")
