@@ -2,8 +2,7 @@ name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: [ 'v*' ]
   workflow_dispatch: {}
 
 permissions:
@@ -15,7 +14,6 @@ jobs:
   goreleaser:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,40 +26,40 @@ jobs:
           go-version: '1.23.x'
           cache: true
 
-      # Robust bpftool install (works on azure runners even when linux-tools-$KREL is missing)
       - name: Install eBPF toolchain (bpftool, clang/llvm)
         run: |
-          set -eux
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             clang llvm make gcc libelf-dev libbpf-dev pkg-config
-
-          KREL="$(uname -r)"
-          sudo apt-get install -y linux-tools-common || true
-          sudo apt-get install -y linux-tools-generic linux-cloud-tools-generic || true
-          sudo apt-get install -y linux-tools-azure linux-cloud-tools-azure || true
-          sudo apt-get install -y "linux-tools-${KREL}" || true
-
-          BPFOOL=""
-          for p in /usr/sbin/bpftool /usr/bin/bpftool \
-                   "/usr/lib/linux-tools-${KREL}/bpftool" \
-                   /usr/lib/linux-tools-*/bpftool; do
-            if [ -x "$p" ]; then BPFOOL="$p"; break; fi
-          done
-
-          if [ -z "$BPFOOL" ]; then
-            echo "bpftool not found via apt; building from source..."
-            sudo apt-get install -y git build-essential flex bison libcap-dev libzstd-dev
-            git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git /tmp/bpf-next
-            make -C /tmp/bpf-next/tools/bpf/bpftool
-            BPFOOL=/tmp/bpf-next/tools/bpf/bpftool/bpftool
+          if sudo apt-get install -y bpftool; then
+            echo "BPFOOL=$(command -v bpftool)" >> "$GITHUB_ENV"
+          else
+            KREL="$(uname -r)"
+            sudo apt-get install -y linux-tools-common || true
+            sudo apt-get install -y linux-tools-generic linux-cloud-tools-generic || true
+            sudo apt-get install -y linux-tools-azure linux-cloud-tools-azure || true
+            sudo apt-get install -y "linux-tools-${KREL}" || true
+            BPFOOL=""
+            for p in /usr/sbin/bpftool /usr/bin/bpftool \
+                     "/usr/lib/linux-tools-${KREL}/bpftool" \
+                     /usr/lib/linux-tools-*/bpftool; do
+              if [ -x "$p" ]; then BPFOOL="$p"; break; fi
+            done
+            if [ -z "$BPFOOL" ]; then
+              echo "bpftool not found via apt; building from source..."
+              sudo apt-get install -y git build-essential flex bison libcap-dev libzstd-dev
+              git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git /tmp/bpf-next
+              make -C /tmp/bpf-next/tools/bpf/bpftool
+              BPFOOL=/tmp/bpf-next/tools/bpf/bpftool/bpftool
+            fi
+            echo "BPFOOL=$BPFOOL" >> "$GITHUB_ENV"
           fi
-
-          echo "BPFOOL=$BPFOOL" >> "$GITHUB_ENV"
-          "$BPFOOL" version
+          echo "Using BPFOOL=${BPFOOL:-$(command -v bpftool || true)}"
+          "${BPFOOL:-$(command -v bpftool)}" version
 
       - name: Prebuild eBPF objects (safe if present)
-        if: ${{ hashFiles('bpf/Makefile') != '' }}
+        if: ${{ hashFiles('bpf/Makefile') != '' && env.BPFOOL != '' }}
         working-directory: bpf
         run: make
         env:
