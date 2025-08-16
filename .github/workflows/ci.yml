@@ -27,13 +27,21 @@ jobs:
 
       - name: Install eBPF toolchain
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm libbpf-dev libelf-dev bpftool make pkg-config
+            clang llvm libbpf-dev libelf-dev make pkg-config linux-tools-common linux-tools-generic
+          KREL="$(uname -r)"
+          sudo apt-get install -y "linux-tools-$KREL" || true
+          BP="/usr/lib/linux-tools-$KREL/bpftool"
+          if [ -x "$BP" ]; then echo "BPFOOL=$BP" >> "$GITHUB_ENV"; fi
+          command -v bpftool >/dev/null 2>&1 && echo "bpftool on PATH"
 
       - name: Build eBPF objects
         working-directory: bpf
         run: make
+        env:
+          BPFOOL: ${{ env.BPFOOL }}
 
       - name: Build (all modules)
         run: go build ./...
@@ -42,5 +50,4 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: Verify static binary builds
-        run: |
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./...
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" ./...
