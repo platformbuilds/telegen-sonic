@@ -1,6 +1,9 @@
+//go:build linux
+
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -10,51 +13,58 @@ import (
 	"github.com/platformbuilds/telegen-sonic/pkg/monitor"
 )
 
-type CoreAdapter struct{ S *monitor.Supervisor }
-
-func (c *CoreAdapter) TryStartJob(req api.StartJobRequest) (api.StartJobResponse, int, error) {
-	resp, code, err := c.S.TryStartJob(struct{ api.StartJobRequest }{req})
-	if err != nil { return api.StartJobResponse{}, code, err }
-	m := resp.(map[string]interface{})
-	return api.StartJobResponse{
-		JobID: m["job_id"].(string), Status: m["status"].(string), Interface: m["interface"].(string),
-	}, code, nil
-}
-func (c *CoreAdapter) GetJob(id string) (api.JobStatus, int, error) {
-	resp, code, err := c.S.GetJob(id)
-	if err != nil { return api.JobStatus{}, code, err }
-	m := resp.(map[string]interface{})
-	return api.JobStatus{
-		JobID: m["job_id"].(string), Status: m["status"].(string),
-		Port: m["port"].(string), Interface: m["interface"].(string),
-	}, code, nil
-}
-func (c *CoreAdapter) StopJob(id string) (api.StopJobResponse, int, error) {
-	resp, code, err := c.S.StopJob(id)
-	if err != nil { return api.StopJobResponse{}, code, err }
-	m := resp.(map[string]interface{})
-	return api.StopJobResponse{ JobID: m["job_id"].(string), Status: m["status"].(string) }, code, nil
-}
-func (c *CoreAdapter) GetResults(id string) (api.JobResults, int, error) {
-	_, code, err := c.S.GetResults(id)
-	if err != nil { return api.JobResults{}, code, err }
-	return api.JobResults{}, code, nil
-}
-
 func main() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if endpoint == "" { endpoint = "localhost:4317" }
-	shutdown, err := monitor.SetupOTel(endpoint, 10*time.Second)
-	if err != nil { log.Fatalf("otel setup failed: %v", err) }
-	defer shutdown(nil)
+	if endpoint == "" {
+		endpoint = "localhost:4317"
+	}
 
-	mir := &monitor.Mirror{}
-	att := &monitor.TC{}
-	col := &monitor.CollectorImpl{}
-	sup := monitor.NewSupervisor(mir, att, col, 2) // hard limit 2
-	adapter := &CoreAdapter{S: sup}
-	h := &api.Handlers{Core: adapter}
+	// 1) Set up OTel metrics
+	ctx := context.Background()
+	mp, meter, err := monitor.SetupOTelMetrics(
+		ctx,
+		"telegen-sonic", // service.name
+		endpoint,
+		false,          // insecure
+		10*time.Second, // export interval
+	)
+	if err != nil {
+		log.Fatalf("otel setup failed: %v", err)
+	}
+	defer func() {
+		shctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = mp.Shutdown(shctx)
+	}()
+
+	// 2) Open pinned BPF maps (ok if missing; your loader may pin them later)
+	statsMap, ifStatsMap, err := monitor.OpenPinnedMaps(monitor.DefaultPinDir)
+	if err != nil {
+		log.Printf("warning: could not open pinned maps: %v", err)
+	}
+
+	// 3) Metrics collector + adapter (implements Supervisor's Collector interface)
+	mc, err := monitor.NewMetricsCollector(meter, statsMap, ifStatsMap, 5*time.Second)
+	if err != nil {
+		log.Fatalf("collector init failed: %v", err)
+	}
+	col := monitor.NewBPFCollector(mc)
+
+	// 4) Your providers (replace with your real implementations if different)
+	mir := &monitor.Mirror{} // implements MirrorProvider
+	att := &monitor.TC{}     // implements AttachProvider
+
+	// 5) Supervisor (implements api.Core) — pass it straight to the API handlers
+	sup := monitor.NewSupervisor(mir, att, col, 2) // Supervisor
+
+	// Use the adapter (implements api.Core)
+	core := &monitor.CoreAdapter{S: sup}
+
+	h := &api.Handlers{Core: core} // api.Core satisfied
 	r := api.NewRouter(h)
+
 	log.Println("listening on 127.0.0.1:8080")
-	log.Fatal(http.ListenAndServe("127.0.0.1:8080", r))
+	if err := http.ListenAndServe("127.0.0.1:8080", r); err != nil {
+		log.Fatal(err)
+	}
 }

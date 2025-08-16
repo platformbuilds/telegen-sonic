@@ -27,7 +27,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version: '1.23.x'
           cache: true
 
       # Optional: ensure modules are resolvable without editing go.mod/sum
@@ -38,5 +38,5 @@ jobs:
       - name: govulncheck
         uses: golang/govulncheck-action@v1
         with:
-          go-version-input: '1.22'
+          go-version-input: '1.23'
           vulncheck-flags: ./...    # add "-test" if you want to scan test deps too
