@@ -1,8 +1,11 @@
+//go:build linux
+
 package api
 
 import (
 	"encoding/json"
 	"net/http"
+
 	"github.com/go-chi/chi/v5"
 )
 

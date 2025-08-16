@@ -1,7 +1,10 @@
+//go:build linux
+
 package api
 
 import (
 	"net/http"
+
 	"github.com/go-chi/chi/v5"
 )
 

@@ -1,3 +1,5 @@
+//go:build linux
+
 package system
 
 import (
@@ -14,7 +16,7 @@ func Run(ctx context.Context, name string, args ...string) (string, string, erro
 	c.Stderr = &errb
 	c.Start()
 	done := make(chan error, 1)
-	go func(){ done <- c.Wait() }()
+	go func() { done <- c.Wait() }()
 	select {
 	case e := <-done:
 		return out.String(), errb.String(), e
