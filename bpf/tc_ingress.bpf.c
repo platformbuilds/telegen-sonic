@@ -1,100 +1,182 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
+// tc_ingress.bpf.c - CO-RE TC ingress program for telegen-sonic
+//
+// Features:
+// - Per-CPU global stats by protocol: IPv4, IPv6, ICMPv6, Other
+// - Per-CPU per-interface (ifindex) stats by protocol
+// - VLAN-aware Ethernet parsing (802.1Q / 802.1ad)
+// - Safe bounds checks for verifier
+// - Attach as tc clsact/ingress
+//
+// Notes:
+// - Requires vmlinux.h generated from /sys/kernel/btf/vmlinux (Makefile).
+// - No <linux/bpf.h> or bcc-style maps.
+// - Userspace must aggregate per-CPU map values for totals.
 
-struct dp_counters {
+#include "vmlinux.h"
+
+#include <bpf/bpf_endian.h>
+#include <bpf/bpf_helpers.h>
+
+// UAPI headers for protocol constants / structs
+#include <linux/if_ether.h>   // ETH_P_*
+#include <linux/if_vlan.h>    // struct vlan_hdr
+#include <linux/in.h>         // IPPROTO_*
+#include <linux/ip.h>         // struct iphdr
+#include <linux/ipv6.h>       // struct ipv6hdr
+#include <linux/icmpv6.h>     // ICMPv6 constants
+#include <linux/pkt_cls.h>    // TC_ACT_*
+
+// ---- Stats structures & keys ----
+
+struct proto_stats {
     __u64 packets;
     __u64 bytes;
 };
 
-// Global per-CPU array[1] -> aggregate stats
+enum {
+    IDX_IPV4 = 0,
+    IDX_IPV6 = 1,
+    IDX_ICMP6 = 2,
+    IDX_OTHER = 3,
+    IDX_MAX
+};
+
+struct if_proto_key {
+    __u32 ifindex;
+    __u32 proto;   // one of IDX_*
+};
+
+// ---- Maps ----
+// Per-CPU global proto stats
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, IDX_MAX);
     __type(key, __u32);
-    __type(value, struct dp_counters);
-} stats SEC(".maps");
+    __type(value, struct proto_stats);
+} stats_percpu SEC(".maps");
 
-// Simple per-protocol counters (index: 1=TCP, 2=UDP, 3=ICMP/ICMPv6, 4=Other)
+// Per-CPU per-interface proto stats (bounded size; tune as needed)
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 5);
-    __type(key, __u32);
-    __type(value, struct dp_counters);
-} proto SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct if_proto_key);
+    __type(value, struct proto_stats);
+} if_stats_percpu SEC(".maps");
 
-static __always_inline void bump(struct bpf_map_def *unused, __u32 idx, __u32 bytes) {
-    // This helper signature is not used; we directly use the map 'proto' and 'stats' above.
+// ---- Helpers ----
+
+static __always_inline void bump_global(__u32 idx, __u32 bytes)
+{
+    struct proto_stats *st = bpf_map_lookup_elem(&stats_percpu, &idx);
+    if (st) {
+        st->packets++;
+        st->bytes += bytes;
+    }
 }
 
-static __always_inline void add_ctr(void *map, __u32 idx, __u32 bytes) {
-    struct dp_counters *c = bpf_map_lookup_elem(map, &idx);
-    if (!c) return;
-    __sync_fetch_and_add(&c->packets, 1);
-    __sync_fetch_and_add(&c->bytes, bytes);
+static __always_inline void bump_if(__u32 ifindex, __u32 idx, __u32 bytes)
+{
+    struct if_proto_key k = {
+        .ifindex = ifindex,
+        .proto   = idx,
+    };
+    struct proto_stats zero = {};
+    struct proto_stats *st = bpf_map_lookup_elem(&if_stats_percpu, &k);
+    if (!st) {
+        // Initialize an entry lazily
+        bpf_map_update_elem(&if_stats_percpu, &k, &zero, BPF_ANY);
+        st = bpf_map_lookup_elem(&if_stats_percpu, &k);
+        if (!st)
+            return;
+    }
+    st->packets++;
+    st->bytes += bytes;
 }
 
-SEC("classifier")
-int tc_ingress(struct __sk_buff *skb) {
-    __u32 bytes = skb->len;
+static __always_inline void bump_all(__u32 ifindex, __u32 idx, __u32 bytes)
+{
+    bump_global(idx, bytes);
+    if (ifindex)
+        bump_if(ifindex, idx, bytes);
+}
 
-    // Update global stats[0]
-    __u32 zero = 0;
-    add_ctr(&stats, zero, bytes);
+static __always_inline int parse_ethproto(void *data, void *data_end, __u16 *eth_proto, void **nh)
+{
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return -1;
 
-    // Parse L2
+    __u16 proto = bpf_ntohs(eth->h_proto);
+    void *cursor = (void *)(eth + 1);
+
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 2; i++) { // handle up to 2 VLAN tags
+        if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
+            if ((char *)cursor + sizeof(struct vlan_hdr) > (char *)data_end)
+                return -1;
+            struct vlan_hdr *vh = cursor;
+            proto = bpf_ntohs(vh->h_vlan_encapsulated_proto);
+            cursor = (char *)cursor + sizeof(struct vlan_hdr);
+        } else {
+            break;
+        }
+    }
+
+    *eth_proto = proto;
+    *nh = cursor;
+    return 0;
+}
+
+// ---- TC ingress program ----
+
+SEC("tc")
+int tc_ingress(struct __sk_buff *skb)
+{
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+    __u32 pkt_len = (__u32)((long)data_end - (long)data);
 
-    struct ethhdr *eth = data;
-    if ((void*)(eth + 1) > data_end) return BPF_OK;
+    // Choose an ifindex for per-port stats. Prefer skb->ifindex; fallback to ingress_ifindex.
+    __u32 ifidx = skb->ifindex;
+    if (!ifidx)
+        ifidx = skb->ingress_ifindex;
 
-    __u16 h_proto = bpf_ntohs(eth->h_proto);
+    __u16 proto = 0;
+    void *nh = data;
 
-    // IPv4
-    if (h_proto == ETH_P_IP) {
-        struct iphdr *iph = (void *)(eth + 1);
-        if ((void*)(iph + 1) > data_end) goto other;
-        __u8 proto_num = iph->protocol;
-        if (proto_num == IPPROTO_TCP) {
-            __u32 idx = 1;
-            add_ctr(&proto, idx, bytes);
-        } else if (proto_num == IPPROTO_UDP) {
-            __u32 idx = 2;
-            add_ctr(&proto, idx, bytes);
-        } else if (proto_num == IPPROTO_ICMP) {
-            __u32 idx = 3;
-            add_ctr(&proto, idx, bytes);
-        } else {
-            __u32 idx = 4;
-            add_ctr(&proto, idx, bytes);
+    if (parse_ethproto(data, data_end, &proto, &nh) < 0) {
+        bump_all(ifidx, IDX_OTHER, pkt_len);
+        return TC_ACT_OK;
+    }
+
+    if (proto == ETH_P_IP) {
+        if ((char *)nh + sizeof(struct iphdr) > (char *)data_end) {
+            bump_all(ifidx, IDX_OTHER, pkt_len);
+            return TC_ACT_OK;
         }
-        return BPF_OK;
-    }
-    // IPv6
-    if (h_proto == ETH_P_IPV6) {
-        struct ipv6hdr *ip6 = (void *)(eth + 1);
-        if ((void*)(ip6 + 1) > data_end) goto other;
-        __u8 proto6 = ip6->nexthdr;
-        if (proto6 == IPPROTO_TCP) {
-            __u32 idx = 1; add_ctr(&proto, idx, bytes);
-        } else if (proto6 == IPPROTO_UDP) {
-            __u32 idx = 2; add_ctr(&proto, idx, bytes);
-        } else if (proto6 == IPPROTO_ICMPV6) {
-            __u32 idx = 3; add_ctr(&proto, idx, bytes);
-        } else {
-            __u32 idx = 4; add_ctr(&proto, idx, bytes);
-        }
-        return BPF_OK;
+        // IPv4
+        bump_all(ifidx, IDX_IPV4, pkt_len);
+        return TC_ACT_OK;
     }
 
-other:
-    {
-        __u32 idx = 4;
-        add_ctr(&proto, idx, bytes);
+    if (proto == ETH_P_IPV6) {
+        if ((char *)nh + sizeof(struct ipv6hdr) > (char *)data_end) {
+            bump_all(ifidx, IDX_OTHER, pkt_len);
+            return TC_ACT_OK;
+        }
+        struct ipv6hdr *ip6h = nh;
+        bump_all(ifidx, IDX_IPV6, pkt_len);
+
+        if (ip6h->nexthdr == IPPROTO_ICMPV6) {
+            bump_all(ifidx, IDX_ICMP6, pkt_len);
+        }
+        return TC_ACT_OK;
     }
-    return BPF_OK;
+
+    bump_all(ifidx, IDX_OTHER, pkt_len);
+    return TC_ACT_OK;
 }
 
-char _license[] SEC("license") = "GPL";
+// Required license
+char LICENSE[] SEC("license") = "GPL";
