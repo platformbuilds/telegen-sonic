@@ -32,31 +32,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             clang llvm make gcc libelf-dev libbpf-dev pkg-config
-          if sudo apt-get install -y bpftool; then
-            echo "BPFOOL=$(command -v bpftool)" >> "$GITHUB_ENV"
-          else
-            KREL="$(uname -r)"
-            sudo apt-get install -y linux-tools-common || true
-            sudo apt-get install -y linux-tools-generic linux-cloud-tools-generic || true
-            sudo apt-get install -y linux-tools-azure linux-cloud-tools-azure || true
-            sudo apt-get install -y "linux-tools-${KREL}" || true
-            BPFOOL=""
-            for p in /usr/sbin/bpftool /usr/bin/bpftool \
-                     "/usr/lib/linux-tools-${KREL}/bpftool" \
-                     /usr/lib/linux-tools-*/bpftool; do
-              if [ -x "$p" ]; then BPFOOL="$p"; break; fi
-            done
-            if [ -z "$BPFOOL" ]; then
-              echo "bpftool not found via apt; building from source..."
-              sudo apt-get install -y git build-essential flex bison libcap-dev libzstd-dev
-              git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git /tmp/bpf-next
-              make -C /tmp/bpf-next/tools/bpf/bpftool
-              BPFOOL=/tmp/bpf-next/tools/bpf/bpftool/bpftool
-            fi
-            echo "BPFOOL=$BPFOOL" >> "$GITHUB_ENV"
+
+          KREL="$(uname -r)"
+          sudo apt-get install -y "linux-tools-$KREL" || true
+
+          BP=""
+          if command -v bpftool >/dev/null 2>&1; then
+            BP="$(command -v bpftool)"
+          elif [ -x "/usr/lib/linux-tools-$KREL/bpftool" ]; then
+            BP="/usr/lib/linux-tools-$KREL/bpftool"
           fi
-          echo "Using BPFOOL=${BPFOOL:-$(command -v bpftool || true)}"
-          "${BPFOOL:-$(command -v bpftool)}" version
+
+          if [ -n "$BP" ]; then
+            echo "Found bpftool at $BP"
+            echo "BPFOOL=$BP" >> "$GITHUB_ENV"
+          else
+            echo "bpftool not found"
+            exit 1
+          fi
+
+      - name: Prebuild eBPF objects
+        if: ${{ hashFiles('bpf/Makefile') != '' }}
+        working-directory: bpf
+        run: make
+        env:
+          BPFOOL: ${{ env.BPFOOL }}
 
       - name: Prebuild eBPF objects (safe if present)
         if: ${{ hashFiles('bpf/Makefile') != '' && env.BPFOOL != '' }}
