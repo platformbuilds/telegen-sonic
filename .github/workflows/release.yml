@@ -25,19 +25,40 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version: '1.23.x'
           cache: true
 
-      - name: Install eBPF toolchain (for prebuilt BPF or Docker)
+      # Robust bpftool install (works on azure runners even when linux-tools-$KREL is missing)
+      - name: Install eBPF toolchain (bpftool, clang/llvm)
         run: |
           set -eux
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm libbpf-dev libelf-dev make pkg-config linux-tools-common linux-tools-generic
+            clang llvm make gcc libelf-dev libbpf-dev pkg-config
+
           KREL="$(uname -r)"
-          sudo apt-get install -y "linux-tools-$KREL" || true
-          BP="/usr/lib/linux-tools-$KREL/bpftool"
-          if [ -x "$BP" ]; then echo "BPFOOL=$BP" >> "$GITHUB_ENV"; fi
+          sudo apt-get install -y linux-tools-common || true
+          sudo apt-get install -y linux-tools-generic linux-cloud-tools-generic || true
+          sudo apt-get install -y linux-tools-azure linux-cloud-tools-azure || true
+          sudo apt-get install -y "linux-tools-${KREL}" || true
+
+          BPFOOL=""
+          for p in /usr/sbin/bpftool /usr/bin/bpftool \
+                   "/usr/lib/linux-tools-${KREL}/bpftool" \
+                   /usr/lib/linux-tools-*/bpftool; do
+            if [ -x "$p" ]; then BPFOOL="$p"; break; fi
+          done
+
+          if [ -z "$BPFOOL" ]; then
+            echo "bpftool not found via apt; building from source..."
+            sudo apt-get install -y git build-essential flex bison libcap-dev libzstd-dev
+            git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git /tmp/bpf-next
+            make -C /tmp/bpf-next/tools/bpf/bpftool
+            BPFOOL=/tmp/bpf-next/tools/bpf/bpftool/bpftool
+          fi
+
+          echo "BPFOOL=$BPFOOL" >> "$GITHUB_ENV"
+          "$BPFOOL" version
 
       - name: Prebuild eBPF objects (safe if present)
         if: ${{ hashFiles('bpf/Makefile') != '' }}
