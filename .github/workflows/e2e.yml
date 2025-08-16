@@ -9,7 +9,7 @@ on:
         required: true
         type: string
 
-  # 2) Actual release runs ONLY after the govulncheck PR is merged
+  # 2) The actual release runs ONLY after the vulncheck PR is merged
   pull_request_target:
     types: [closed]
 
@@ -33,7 +33,7 @@ concurrency:
 # --------------------------------------------------------------------
 jobs:
   create-tag:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: github.event_name == 'workflow_dispatch'
     name: Create tag (manual, owner/admin only)
     runs-on: ubuntu-latest
     steps:
@@ -45,10 +45,12 @@ jobs:
             const repo  = context.repo.repo;
             const actor = context.actor.toLowerCase();
 
+            // owner org == actor user (personal repo) — allow
             if (actor === owner) {
               core.info(`Actor ${actor} is repo owner ${owner}; allowed.`);
               return;
             }
+            // otherwise require admin permission
             const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
               owner, repo, username: context.actor
             });
@@ -71,15 +73,17 @@ jobs:
             const tag   = process.env.RELEASE_TAG;
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-
             try {
               await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
               core.info(`Tag ${tag} already exists.`);
             } catch (e) {
               if (e.status !== 404) throw e;
-              const sha = context.sha;
-              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
-              core.info(`Created refs/tags/${tag} -> ${sha}`);
+              await github.rest.git.createRef({
+                owner, repo,
+                ref: `refs/tags/${tag}`,
+                sha: context.sha
+              });
+              core.info(`Created refs/tags/${tag}`);
             }
 
       - name: Ensure draft GitHub Release exists
@@ -91,27 +95,25 @@ jobs:
             const repo  = context.repo.repo;
 
             try {
-              const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-              core.info(`Release for ${tag} already exists (id=${rel.data.id}).`);
-              return;
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`Release for ${tag} already exists.`);
             } catch (e) {
               if (e.status !== 404) throw e;
+              const res = await github.rest.repos.createRelease({
+                owner, repo,
+                tag_name: tag,
+                target_commitish: context.sha,
+                name: tag,
+                body: `Draft release for **${tag}** (created by workflow). Artifacts will be attached by CI.`,
+                draft: true,
+                prerelease: false,
+                generate_release_notes: true
+              });
+              core.info(`Created draft release id=${res.data.id} for tag ${tag}.`);
             }
 
-            const res = await github.rest.repos.createRelease({
-              owner, repo,
-              tag_name: tag,
-              target_commitish: context.sha,
-              name: tag,
-              body: `Draft release for **${tag}** (created by workflow). Artifacts will be attached by CI.`,
-              draft: true,
-              prerelease: false,
-              generate_release_notes: true
-            });
-            core.info(`Created draft release id=${res.data.id} for tag ${tag}.`)
-
   govulncheck:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: github.event_name == 'workflow_dispatch'
     name: Security gate (govulncheck FIRST) + PR
     runs-on: ubuntu-latest
     needs: [create-tag]
@@ -129,11 +131,6 @@ jobs:
       - name: Verify modules resolve (RO mode)
         run: go list ./... >/dev/null
 
-      - name: Install jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
       - name: Run govulncheck (JSON)
         uses: golang/govulncheck-action@v1
         with:
@@ -144,66 +141,78 @@ jobs:
           check-latest: true
           cache: true
 
-      - name: Compute findings count (no fail)
-        id: count
-        shell: bash
-        run: |
-          set -euo pipefail
-          COUNT="$(jq -r '.vulns | length' govuln.json)"
-          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
-          echo "GOVULN_COUNT=${COUNT}" >> "$GITHUB_ENV"
+      # Robust, jq-free parsing & write-outs
+      - name: Analyze report and stage README/report files
+        id: analyze
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const TAG = process.env.RELEASE_TAG;
+            const SAFE_TAG = TAG.replace(/\//g,'-');
 
-      - name: Prepare report, README section, and .release/tag
-        run: |
-          set -euxo pipefail
-          TAG="${{ env.RELEASE_TAG }}"
-          SAFE_TAG="${TAG//\//-}"
-          mkdir -p reports/govulncheck .release
-          jq '.' govuln.json > "reports/govulncheck/${SAFE_TAG}.json"
-          echo "$TAG" > .release/tag
+            // read & parse JSON safely
+            const raw = fs.readFileSync('govuln.json','utf8');
+            let doc;
+            try {
+              doc = JSON.parse(raw);
+            } catch (e) {
+              core.setFailed(`Unable to parse govuln.json: ${e.message}`);
+              return;
+            }
+            const count = Array.isArray(doc.vulns) ? doc.vulns.length : 0;
+            core.setOutput('count', String(count));
 
-          COUNT="${GOVULN_COUNT:-0}"
-          DATE="$(date -u +'%Y-%m-%d %H:%M:%SZ')"
-          LINK="reports/govulncheck/${SAFE_TAG}.json"
+            // write .release/tag
+            fs.mkdirSync('.release', { recursive: true });
+            fs.writeFileSync('.release/tag', TAG);
 
-          cat > .govul-section.md <<EOF
-          <!-- GOVULNCHECK-START -->
-          ### govulncheck
+            // write pretty report
+            const outDir = path.join('reports','govulncheck');
+            fs.mkdirSync(outDir, { recursive: true });
+            const outPath = path.join(outDir, `${SAFE_TAG}.json`);
+            fs.writeFileSync(outPath, JSON.stringify(doc, null, 2), 'utf8');
 
-          | Field | Value |
-          |------:|:------|
-          | Tag | **${TAG}** |
-          | Scan Time (UTC) | ${DATE} |
-          | Findings | **${COUNT}** |
-          | Full Report | [${LINK}](${LINK}) |
+            // update README section
+            const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+            const section =
+                `<!-- GOVULNCHECK-START -->
+                    ### govulncheck
+                    | Field | Value |
+                    |------:|:------|
+                    | Tag | **${TAG}** |
+                    | Scan Time (UTC) | ${date} |
+                    | Findings | **${count}** |
+                    | Full Report | [${outPath}](${outPath}) |
+                    _This section is auto-updated by the e2e release workflow._
+                    <!-- GOVULNCHECK-END -->
+                `;
+            const readme = fs.existsSync('README.md') ? fs.readFileSync('README.md','utf8') : '';
+            const start = '<!-- GOVULNCHECK-START -->';
+            const end   = '<!-- GOVULNCHECK-END -->';
 
-          _This section is auto-updated by the e2e release workflow._
-          <!-- GOVULNCHECK-END -->
-          EOF
-
-          if grep -q '<!-- GOVULNCHECK-START -->' README.md; then
-            START='<!-- GOVULNCHECK-START -->'
-            END='<!-- GOVULNCHECK-END -->'
-            awk -v s="$START" -v e="$END" '
-              $0 ~ s {print; system("cat .govul-section.md"); skip=1; next}
-              $0 ~ e {print; skip=0}
-              skip==0 {print}
-            ' README.md > README.md.new
-            mv README.md.new README.md
-          else
-            printf "\n%s\n" >> README.md
-            cat .govul-section.md >> README.md
-          fi
+            let next;
+            if (readme.includes(start) && readme.includes(end)) {
+              const pre  = readme.split(start)[0];
+              const post = readme.split(end).slice(1).join(end);
+              next = pre + section + post;
+            } else {
+              next = readme + '\n' + section + '\n';
+            }
+            fs.writeFileSync('README.md', next, 'utf8');
 
       - name: Create PR with report & README
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "chore(govulncheck): add report for ${{ env.RELEASE_TAG }} and update README"
           branch: "chore/govulncheck-${{ env.RELEASE_TAG && env.RELEASE_TAG != '' && env.RELEASE_TAG || github.run_id }}-${{ github.run_id }}"
-          title: "govulncheck: report for ${{ env.RELEASE_TAG }}"
+          # Requirement: PR title must start with [vulncheck]
+          title: "[vulncheck] report for ${{ env.RELEASE_TAG }}"
           body: |
             This PR adds the **govulncheck** report for `${{ env.RELEASE_TAG }}` and updates the README summary section.
-            Findings: `${{ env.GOVULN_COUNT || '0' }}`
+
+            Findings: `${{ steps.analyze.outputs.count }}`
           labels: |
             security
             automated-pr
@@ -214,12 +223,8 @@ jobs:
 # PATH B: PR merged -> build, test, image + binaries -> release
 # --------------------------------------------------------------------
   release-on-merge:
-    if: >
-      ${{
-        github.event_name == 'pull_request_target' &&
-        github.event.pull_request.merged == true &&
-        startsWith(github.event.pull_request.head.ref, 'chore/govulncheck-')
-      }}
+    # Run only when a PR was merged AND its title starts with "[vulncheck]"
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && startsWith(github.event.pull_request.title, '[vulncheck]')
     name: Release after PR merge (owner/admin gate)
     runs-on: ubuntu-latest
     steps:
@@ -227,10 +232,15 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const merger = context.payload.pull_request.merged_by?.login;
-            if (!merger) core.setFailed('Cannot detect merger.');
+            const owner  = context.repo.owner;
+            const repo   = context.repo.repo;
+            const number = context.payload.pull_request.number;
+
+            // refresh PR to get merged_by reliably
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            if (!pr.merged) core.setFailed('PR is not merged');
+
+            const merger = (pr.merged_by && pr.merged_by.login) ? pr.merged_by.login : context.actor;
             const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
               owner, repo, username: merger
             });
