@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
@@ -18,10 +19,10 @@ func TestNewMetricsCollector_Valid(t *testing.T) {
 	meter := mp.Meter("test")
 
 	// Pass non-nil *ebpf.Map placeholders; the ctor only checks for nil
-	statsMap := &dummyEBPFMap{}
-	ifStatsMap := &dummyEBPFMap{}
+	statsMap := &ebpf.Map{}
+	ifStatsMap := &ebpf.Map{}
 
-	c, err := NewMetricsCollector(meter, (*dummyAsRealMap)(statsMap).real(), (*dummyAsRealMap)(ifStatsMap).real(), 2*time.Second)
+	c, err := NewMetricsCollector(meter, statsMap, ifStatsMap, 2*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -34,10 +35,10 @@ func TestNewMetricsCollector_Valid(t *testing.T) {
 }
 
 func TestNewMetricsCollector_Errors(t *testing.T) {
-	statsMap := &dummyEBPFMap{}
+	statsMap := &ebpf.Map{}
 
 	// nil meter
-	if _, err := NewMetricsCollector(nil, (*dummyAsRealMap)(statsMap).real(), nil, time.Second); err == nil {
+	if _, err := NewMetricsCollector(nil, statsMap, nil, time.Second); err == nil {
 		t.Fatalf("expected error for nil meter")
 	}
 
@@ -49,7 +50,7 @@ func TestNewMetricsCollector_Errors(t *testing.T) {
 	}
 
 	// non-positive interval -> defaulted (no error)
-	if c, err := NewMetricsCollector(meter, (*dummyAsRealMap)(statsMap).real(), nil, 0); err != nil {
+	if c, err := NewMetricsCollector(meter, statsMap, nil, 0); err != nil {
 		t.Fatalf("unexpected error for 0 interval: %v", err)
 	} else if c.interval <= 0 {
 		t.Fatalf("interval was not defaulted")
@@ -95,35 +96,3 @@ func TestSumSliceProtoStats(t *testing.T) {
 		t.Fatalf("sumSlice = %+v, want Packets=6 Bytes=60", out)
 	}
 }
-
-/*
-   ------ tiny stubs to satisfy constructor without hitting the kernel ------
-
-   NewMetricsCollector only checks statsMap != nil, it doesn't use the maps
-   until Start()/collectOnce. To avoid importing a real *ebpf.Map (which needs
-   kernel capabilities), we define a zero-sized dummy that we can convert to
-   the real type via an empty pointer cast. We never call any methods on it.
-*/
-
-// Use an empty struct as a stand-in.
-type dummyEBPFMap struct{}
-
-// dummyAsRealMap is a helper to cast our dummy to *ebpf.Map without importing
-// ebpf in the test file. The production code only stores the pointer and
-// won't dereference it in these tests.
-type dummyAsRealMap dummyEBPFMap
-
-// real returns a typed pointer that satisfies NewMetricsCollector signature.
-// We rely on the fact we don't call any methods on it in these tests.
-func (d *dummyAsRealMap) real() *ebpfMapShim { // see type alias below
-	return (*ebpfMapShim)(nil)
-}
-
-/*
-   We add a minimal type alias named ebpfMapShim so we don't pull the whole
-   cilium/ebpf package into the unit test just for the type name.
-   In production, NewMetricsCollector expects *ebpf.Map, and this alias
-   will resolve to that concrete type via a build tag–guarded alias.
-*/
-
-// ebpfMapShim is declared in a tiny shim file to keep imports clean.
