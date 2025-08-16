@@ -25,17 +25,37 @@ jobs:
           go-version: '1.23.x'
           cache: true
 
-      - name: Install eBPF toolchain
+      - name: Install eBPF toolchain (bpftool, clang/llvm)
         run: |
-          set -eux
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm libbpf-dev libelf-dev make pkg-config linux-tools-common linux-tools-generic
+            clang llvm make gcc libelf-dev libbpf-dev pkg-config
+
           KREL="$(uname -r)"
           sudo apt-get install -y "linux-tools-$KREL" || true
-          BP="/usr/lib/linux-tools-$KREL/bpftool"
-          if [ -x "$BP" ]; then echo "BPFOOL=$BP" >> "$GITHUB_ENV"; fi
-          command -v bpftool >/dev/null 2>&1 && echo "bpftool on PATH"
+
+          BP=""
+          if command -v bpftool >/dev/null 2>&1; then
+            BP="$(command -v bpftool)"
+          elif [ -x "/usr/lib/linux-tools-$KREL/bpftool" ]; then
+            BP="/usr/lib/linux-tools-$KREL/bpftool"
+          fi
+
+          if [ -n "$BP" ]; then
+            echo "Found bpftool at $BP"
+            echo "BPFOOL=$BP" >> "$GITHUB_ENV"
+          else
+            echo "bpftool not found"
+            exit 1
+          fi
+
+      - name: Prebuild eBPF objects
+        if: ${{ hashFiles('bpf/Makefile') != '' }}
+        working-directory: bpf
+        run: make
+        env:
+          BPFOOL: ${{ env.BPFOOL }}
 
       - name: Build eBPF objects
         working-directory: bpf

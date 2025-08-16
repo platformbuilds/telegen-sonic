@@ -26,6 +26,7 @@ jobs:
           go-version: '1.23.x'
           cache: true
 
+      # Robust bpftool install; exports BPFOOL for later steps
       - name: Install eBPF toolchain (bpftool, clang/llvm)
         run: |
           set -euxo pipefail
@@ -34,13 +35,14 @@ jobs:
             clang llvm make gcc libelf-dev libbpf-dev pkg-config
 
           KREL="$(uname -r)"
-          sudo apt-get install -y "linux-tools-$KREL" || true
+          # Try the exact package; if not there, we’ll still try PATH later
+          sudo apt-get install -y "linux-tools-${KREL}" || true
 
           BP=""
           if command -v bpftool >/dev/null 2>&1; then
             BP="$(command -v bpftool)"
-          elif [ -x "/usr/lib/linux-tools-$KREL/bpftool" ]; then
-            BP="/usr/lib/linux-tools-$KREL/bpftool"
+          elif [ -x "/usr/lib/linux-tools-${KREL}/bpftool" ]; then
+            BP="/usr/lib/linux-tools-${KREL}/bpftool"
           fi
 
           if [ -n "$BP" ]; then
@@ -51,13 +53,7 @@ jobs:
             exit 1
           fi
 
-      - name: Prebuild eBPF objects
-        if: ${{ hashFiles('bpf/Makefile') != '' }}
-        working-directory: bpf
-        run: make
-        env:
-          BPFOOL: ${{ env.BPFOOL }}
-
+      # ❗ Only one prebuild step, and it only runs when BPFOOL is available
       - name: Prebuild eBPF objects (safe if present)
         if: ${{ hashFiles('bpf/Makefile') != '' && env.BPFOOL != '' }}
         working-directory: bpf
