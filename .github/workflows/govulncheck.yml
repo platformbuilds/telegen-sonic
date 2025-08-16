@@ -5,15 +5,21 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    - cron: "0 6 * * 1"  # optional: weekly Monday 06:00 UTC sweep
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
+env:
+  GOFLAGS: -mod=readonly  # fail if the build would mutate go.mod/go.sum
+
 jobs:
   scan:
     name: Run govulncheck
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,8 +30,13 @@ jobs:
           go-version: '1.22.x'
           cache: true
 
+      # Optional: ensure modules are resolvable without editing go.mod/sum
+      - name: Verify modules are tidy
+        run: |
+          go list ./... >/dev/null
+
       - name: govulncheck
         uses: golang/govulncheck-action@v1
         with:
           go-version-input: '1.22'
-          vulncheck-flags: ./...
+          vulncheck-flags: ./...    # add "-test" if you want to scan test deps too

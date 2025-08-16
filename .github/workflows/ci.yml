@@ -43,6 +43,12 @@ jobs:
         env:
           BPFOOL: ${{ env.BPFOOL }}
 
+      - name: Sync modules (tidy + download)
+        run: |
+          go env -w GOPROXY=https://proxy.golang.org,direct
+          go mod tidy
+          go mod download all
+
       - name: Build (all modules)
         run: go build ./...
 

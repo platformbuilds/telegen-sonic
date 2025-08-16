@@ -38,7 +38,6 @@ jobs:
           sudo apt-get install -y "linux-tools-$KREL" || true
           BP="/usr/lib/linux-tools-$KREL/bpftool"
           if [ -x "$BP" ]; then echo "BPFOOL=$BP" >> "$GITHUB_ENV"; fi
-          command -v bpftool >/dev/null 2>&1 && echo "bpftool on PATH"
 
       - name: Prebuild eBPF objects (safe if present)
         if: ${{ hashFiles('bpf/Makefile') != '' }}
@@ -46,6 +45,12 @@ jobs:
         run: make
         env:
           BPFOOL: ${{ env.BPFOOL }}
+
+      - name: Sync modules (tidy + download)
+        run: |
+          go env -w GOPROXY=https://proxy.golang.org,direct
+          go mod tidy
+          go mod download all
 
       - name: Install GoReleaser
         uses: goreleaser/goreleaser-action@v6

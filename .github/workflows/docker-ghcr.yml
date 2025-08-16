@@ -24,6 +24,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+
       - name: Install eBPF toolchain (for building .bpf.o before image)
         run: |
           set -eux
@@ -41,6 +47,12 @@ jobs:
         run: make
         env:
           BPFOOL: ${{ env.BPFOOL }}
+
+      - name: Sync modules (tidy + download)
+        run: |
+          go env -w GOPROXY=https://proxy.golang.org,direct
+          go mod tidy
+          go mod download all
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
